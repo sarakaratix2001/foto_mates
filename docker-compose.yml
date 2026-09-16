@@ -1,0 +1,24 @@
+services:
+  fotomates:
+    build: .
+    image: fotomates
+
+    env_file:
+      - .env
+    environment:
+      FOTOMATES_HOST: 0.0.0.0
+      FOTOMATES_PORT: 8081
+      FOTOMATES_RUNS: /data/web_runs
+    ports:
+      - "127.0.0.1:${FOTOMATES_PUBLISH_PORT:-8081}:8081"
+    volumes:
+      - fotomates-data:/data
+      - type: bind
+        source: ./foto mates
+        target: /photos
+        read_only: true
+    restart: unless-stopped
+
+volumes:
+
+  fotomates-data:

@@ -1,0 +1,22 @@
+# Keep the build context small and secrets out of the image.
+.env
+.git
+.gitignore
+.idea
+__pycache__/
+*.pyc
+_wf_scratch/
+tests/
+
+# Runtime state belongs in volumes, not baked into the image.
+web_runs/
+reading_cache.sqlite3
+reading_cache.sqlite3.*
+web_server.log
+extracted_readings.html
+
+# Sample photographs and the unused YOLO checkpoint (25 MB) are not needed:
+# recognition happens on the remote OCR server.
+foto mates/
+segmented_readings/
+*.pt
