@@ -276,36 +276,39 @@ def extract_device_type(text: str) -> str | None:
 
 
 def extract_window_decimals(text: str) -> int | None:
-    """Wheels at the right end whose window the model described differently from
-    the wheel before them (WINDOWS: dark dark dark dark dark white-box gives 1);
-    None without one window word per digit of READING."""
+    """Decimal wheels by the one rule: at the right end, a wheel whose digit is
+    smaller (-small) or whose window has another colour than most of the wheels
+    (WINDOWS: dark dark dark dark dark red gives 1; ... dark-small gives 1; a frame,
+    dot or printed 0.1 alone gives 0). None without one window word per digit."""
     lines = re.findall(r'^WINDOWS:[ \t]*([^\n]*)', text, re.IGNORECASE | re.MULTILINE)
     windows = lines[-1].lower().split() if lines else []
     digits = _reading_digits(text)
     if not digits or len(windows) != len(digits):
         return None
-    last = len(windows)
-    while last > 1 and windows[last - 1] == windows[-1]:
-        last -= 1
-    set_apart = len(windows) - last
-    # Only a short group after a run of alike integer wheels; a first wheel that
-    # looks different does not make every wheel after it a decimal.
-    alike = len(set(windows[:last])) == 1
-    return set_apart if windows[last - 1] != windows[-1] and alike and set_apart < last else 0
+    colours = [word.split('-')[0] for word in windows]
+    colour = max(set(colours), key=colours.count)  # the integer wheels' colour
+    marked = [word.split('-')[0] != colour or 'small' in word.split('-')[1:] for word in windows]
+    decimals = len(marked) - next((i + 1 for i in range(len(marked) - 1, -1, -1) if not marked[i]), 0)
+    # Only a short group after unmarked integer wheels: one odd wheel in the
+    # middle does not make every wheel after it a decimal.
+    return decimals if decimals < len(windows) and not any(marked[:len(marked) - decimals]) else 0
 
 
 def extract_decimal_digits(text: str) -> int | None:
-    """Mechanical fractional wheels identified visually, never from the saved value:
-    the DECIMALS answer, or more when the model's own WINDOWS line sets more wheels
-    apart at the right end."""
+    """Mechanical decimal wheels identified visually, never from the saved value:
+    from the WINDOWS line by the one rule (smaller digit or a box of another
+    colour); the model's DECIMALS answer only when WINDOWS is missing or does
+    not have one word per digit."""
     if extract_device_type(text) != 'mechanical':
         return None
     answers = re.findall(r'^DECIMALS:[ \t]*(\d+|UNKNOWN)[ \t]*$', text, re.IGNORECASE | re.MULTILINE)
     windows = extract_window_decimals(text)
-    if not answers or answers[-1].upper() == 'UNKNOWN':
-        count = windows or None
+    if windows is not None:
+        count = windows
+    elif not answers or answers[-1].upper() == 'UNKNOWN':
+        count = None
     else:
-        count = max(int(answers[-1]), windows or 0)
+        count = int(answers[-1])
     digits = _reading_digits(text)
     return count if count is not None and digits and 0 <= count < len(digits) else None
 
@@ -634,13 +637,14 @@ _COMPACT_SYSTEM_PROMPT = (
     "TYPE: DIGITAL (LCD or LED segments) or MECHANICAL (printed number wheels)\n"
     "CELLS: MECHANICAL: one digit per wheel, left to right, space separated; DIGITAL: NONE\n"
     "WINDOWS: MECHANICAL: one word per wheel for its window colour (dark, white, red, "
-    "orange, yellow, other), with -box when it has its own frame; DIGITAL: NONE\n"
+    "orange, yellow, other), with -small when its digit is smaller than the other "
+    "wheels' digits; DIGITAL: NONE\n"
     "READING: every digit of the main row as one string with no dot or comma, or "
     "UNREADABLE, or NO METER\n"
     "ROLLING: MECHANICAL wheels caught between two numbers as position:lower-upper, "
     "comma separated; otherwise NONE\n"
-    "DECIMALS: MECHANICAL: number of marked fractional wheels at the right end, 0 if "
-    "none; DIGITAL or unclear: UNKNOWN")
+    "DECIMALS: MECHANICAL: number of wheels at the right end with a smaller digit or "
+    "a box of another colour, 0 if none; DIGITAL: UNKNOWN")
 _COMPACT_USER_PROMPT = (
     "TASK\n"
     "Read the consumption register: the main row of the largest digits on the display.\n"
@@ -671,16 +675,18 @@ _COMPACT_USER_PROMPT = (
     "- 5 or 6: a 6 closes its lower half on the left; a 5 is open at the lower left.\n"
     "\n"
     "DECIMALS (MECHANICAL)\n"
-    "- Write WINDOWS first. Wheels at the right end are fractional only when something "
-    "sets them apart from the wheels before them: a different window colour (red, pink, "
-    "magenta, orange, yellow, or white where the others are dark, or the reverse; glare "
-    "can make red look pale), a frame of their own, a decimal point or comma, or a 0.1, "
-    "x0.1 or 1/10 scale above them. Otherwise DECIMALS: 0; being last is no evidence. "
-    "Keep fractional wheels in READING.\n"
-    "- Examples: black wheels 0 4 7 2 9 3 then a red wheel 6: READING: 0472936, "
-    "DECIMALS: 1. A dark band 0 4 2 9 6 then a 7 in its own white box: WINDOWS: dark dark "
-    "dark dark dark white-box, READING: 042967, DECIMALS: 1. Black wheels 3 8 1 2 5 6, "
-    "all alike: READING: 381256, DECIMALS: 0.\n"
+    "- Write WINDOWS first. A wheel at the right end is a decimal ONLY when its digit is "
+    "smaller than the other wheels' digits, or it sits in a box of another colour than "
+    "the wheels before it (red, pink, orange, yellow, or white where the others are dark; "
+    "glare can make red look pale). Nothing else makes a decimal: not a frame of the same "
+    "colour, not a dot or comma, not a printed 0.1 label, not being the last wheel. "
+    "Otherwise DECIMALS: 0. Keep decimal wheels in READING.\n"
+    "- Examples: black wheels 0 4 7 2 9 3 then a 6 in a red box: WINDOWS: dark dark dark "
+    "dark dark dark red, READING: 0472936, DECIMALS: 1. A dark band 0 4 2 9 6 then a 7 "
+    "in a white box: WINDOWS: dark dark dark dark dark white, READING: 042967, DECIMALS: "
+    "1. Wheels 1 2 3 4 5 then a smaller 6, same colour: WINDOWS: dark dark dark dark dark "
+    "dark-small, READING: 123456, DECIMALS: 1. Black wheels 3 8 1 2 5 6, all the same "
+    "size and colour: READING: 381256, DECIMALS: 0.\n"
     "\n"
     "ROLLING (MECHANICAL)\n"
     "- A wheel showing parts of two numbers: write the lower in READING (9 when it turns "

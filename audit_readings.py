@@ -117,25 +117,30 @@ def photos(folders):
     excluded = processing_exclusions()
     while stack:
         folder = stack.pop()
-        ready = []
-        # Finish and close the network directory listing before yielding photos.
-        # The consumer can spend hours awaiting inference; keeping an SMB/CIFS
-        # enumeration open throughout that work risks an incomplete listing.
+        found = 0
+        print(f'Source scan: listing {folder} (a day folder on the share takes a few minutes) ...', flush=True)
+        # Each photo is yielded as soon as it is listed, so reading starts at once.
+        # Read through prefetch(), the listing never waits for the reads: the SMB
+        # enumeration stays open only as long as the listing itself takes.
         with os.scandir(folder) as entries:
             for entry in entries:
                 if entry.is_dir(follow_symlinks=False):
                     stack.append(Path(entry.path))
                 elif entry.name not in excluded and Path(entry.name).suffix.lower() in PHOTO_TYPES:
-                    ready.append(Path(entry.path))
-        print(f'Source scan: {folder}: {len(ready)} eligible photos', flush=True)
-        yield from ready
+                    found += 1
+                    if found % 10000 == 0:
+                        print(f'Source scan: {folder}: {found} photos listed so far ...', flush=True)
+                    yield Path(entry.path)
+        print(f'Source scan: {folder}: {found} eligible photos', flush=True)
 
 
-def prefetch(iterable, size=20000):
-    """The items of iterable, produced in a thread of their own: the next folder
-    on the share is listed while the photos of the one before are being read, so
-    the model server is not left idle for the minutes a 100 000-file listing
-    takes. An error of the listing is raised here, where the caller handles it."""
+def prefetch(iterable, size=0):
+    """The items of iterable, produced in a thread of their own: folders on the
+    share are listed while their photos are being read, so the model server is
+    not left idle for the minutes a 100 000-file listing takes. The queue has no
+    limit (size 0): the listing never waits for the reads, so a network folder's
+    enumeration is never held open. An error of the listing is raised here,
+    where the caller handles it."""
     items, end = queue.Queue(size), object()
 
     def fill():
