@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import os
 
-# A mismatch at or above this evaluation score is a confident wrong read.
 SCORE_THRESHOLD = float(os.environ.get('FOTOMATES_EVAL_SCORE', '0.8'))
 
-# (key, label), in the order shown.
 GROUPS = [
     ('matched', 'Matched the saved reading'),
     ('mismatch_high', f'Mismatched, evaluation score {SCORE_THRESHOLD} or higher'),

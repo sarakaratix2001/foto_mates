@@ -13,7 +13,6 @@ if not hasattr(cv2, "ml") or not hasattr(cv2.ml, "EM_create"):
         "removed cv2.ml; install opencv-python>=4.10,<5. Refusing to start "
         "rather than read digits from uncorrected pixels."
     )
-
 def _setting(name: str, default: str) -> float:
     return float(os.environ.get(name, default))
 

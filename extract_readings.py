@@ -11,7 +11,6 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-
 import cv2
 import httpx
 import numpy as np

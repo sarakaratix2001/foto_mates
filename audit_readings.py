@@ -11,7 +11,6 @@ from pathlib import Path
 import re
 import sqlite3
 import time
-
 from evaluation import GROUPS as EVALUATION_GROUPS, SCORE_THRESHOLD, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, RETAKE_SCORE, WORKERS_PER_SLOT, _reading_digits, ocr_image,
                               server_slots, extract_no_meter, score_reading)
