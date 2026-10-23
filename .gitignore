@@ -8,9 +8,15 @@ __pycache__/
 # Runtime state, not source
 web_runs/
 reading_cache.sqlite3
+audit_readings.sqlite3*
 reading_cache.sqlite3.*
 extracted_readings.html
 
 # Customer meter photos. Delete this line if you want the samples in the repo
 # and the repository is private.
 foto mates/
+
+# Recovered customer data and filename reference dataset
+recovery/
+ground_truth_data/*
+!ground_truth_data/README.md

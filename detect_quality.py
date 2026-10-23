@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import os
 import sys
 import threading
 
@@ -13,13 +14,26 @@ if not hasattr(cv2, "ml") or not hasattr(cv2.ml, "EM_create"):
         "rather than read digits from uncorrected pixels."
     )
 
-BLUR_THRESHOLD = 120.0
-LOW_CONTRAST_THRESHOLD = 40.0
-DARK_THRESHOLD = 85.0
-BRIGHT_THRESHOLD = 200.0
+def _setting(name: str, default: str) -> float:
+    return float(os.environ.get(name, default))
 
-NOISE_ABSOLUTE_MIN_VARIANCE = 800.0
-NOISE_VARIANCE_RATIO_THRESHOLD = 0.35
+
+# What makes a photo blurry, low-contrast (grey std), dark or bright (grey mean, 0..255).
+BLUR_THRESHOLD = _setting('FOTOMATES_BLUR_THRESHOLD', '120')
+LOW_CONTRAST_THRESHOLD = _setting('FOTOMATES_LOW_CONTRAST_THRESHOLD', '40')
+DARK_THRESHOLD = _setting('FOTOMATES_DARK_THRESHOLD', '85')
+BRIGHT_THRESHOLD = _setting('FOTOMATES_BRIGHT_THRESHOLD', '200')
+
+# Noisy: sharpness above this, that falls below this share after a median filter.
+NOISE_ABSOLUTE_MIN_VARIANCE = _setting('FOTOMATES_NOISE_MIN_VARIANCE', '800')
+NOISE_VARIANCE_RATIO_THRESHOLD = _setting('FOTOMATES_NOISE_RATIO', '0.35')
+
+# Glare: pixels at least this bright (0..255) and at most this saturated, covering
+# this share of the photo, or one patch of them covering this share.
+GLARE_MIN_VALUE = _setting('FOTOMATES_GLARE_MIN_VALUE', '235')
+GLARE_MAX_SATURATION = _setting('FOTOMATES_GLARE_MAX_SATURATION', '55')
+GLARE_FRACTION = _setting('FOTOMATES_GLARE_FRACTION', '0.025')
+GLARE_PATCH_FRACTION = _setting('FOTOMATES_GLARE_PATCH_FRACTION', '0.012')
 
 
 _GMM_SAMPLE_CAP = 5_000
@@ -48,14 +62,14 @@ def assess(bgr: np.ndarray) -> dict:
         and midtone_fraction < 0.14 and raw_blur > 500.0
     )
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    glare_mask = ((hsv[:, :, 2] >= 235) & (hsv[:, :, 1] <= 55)).astype(np.uint8)
+    glare_mask = ((hsv[:, :, 2] >= GLARE_MIN_VALUE) & (hsv[:, :, 1] <= GLARE_MAX_SATURATION)).astype(np.uint8)
     glare_fraction = float(glare_mask.mean())
     n_labels, _, stats, _ = cv2.connectedComponentsWithStats(glare_mask, 8)
     largest_glare = (
         float(stats[1:, cv2.CC_STAT_AREA].max()) / gray.size
         if n_labels > 1 else 0.0
     )
-    has_glare = glare_fraction >= 0.025 or largest_glare >= 0.012
+    has_glare = glare_fraction >= GLARE_FRACTION or largest_glare >= GLARE_PATCH_FRACTION
 
     return {
         "blur_variance": round(blur, 1),
@@ -75,7 +89,7 @@ def assess(bgr: np.ndarray) -> dict:
 
 def _glare_mask(bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    mask = ((hsv[:, :, 2] >= 235) & (hsv[:, :, 1] <= 55)).astype(np.uint8) * 255
+    mask = ((hsv[:, :, 2] >= GLARE_MIN_VALUE) & (hsv[:, :, 1] <= GLARE_MAX_SATURATION)).astype(np.uint8) * 255
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     return cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
 
@@ -109,12 +123,52 @@ def _corrected_channel(channel, bgr, report, force_gmm):
     return cv2.addWeighted(channel, 1.0 + amount, blurred, -amount, 0)
 
 
+def adjust_light(bgr: np.ndarray) -> np.ndarray:
+    """Brightness and contrast set from this photo's own light, colours kept.
+
+    Each region is brightened or darkened by how far its local brightness sits
+    from mid-grey, so a dark LCD next to a white label is lifted while the label
+    is left alone. The lightness is then stretched so its 1st..99th percentiles
+    span the full range. A well-exposed, evenly lit photo changes little.
+    """
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    lightness = lab[:, :, 0].astype(np.float32) / 255
+    # About the height of a meter display, so the display is judged by itself.
+    sigma = max(lightness.shape) / 30
+    local = np.clip(cv2.GaussianBlur(lightness, (0, 0), sigma), 0.03, 0.97)
+    # Per pixel gamma that maps the local mean to mid-grey, limited so noise in
+    # near-black corners is not blown up.
+    gamma = np.clip(np.log(0.5) / np.log(local), 0.35, 1.6)
+    lifted = lightness ** gamma
+    lo, hi = np.percentile(lifted, (1, 99))
+    if hi - lo >= 0.07:
+        lifted = np.clip((lifted - lo) / (hi - lo), 0, 1)
+    lab[:, :, 0] = (lifted * 255).astype(np.uint8)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
 def enhance_for_ocr(
     bgr: np.ndarray, report: dict | None = None, *, force_gmm: bool = False,
 ) -> np.ndarray:
     report = report or assess(bgr)
     gray = _corrected_channel(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), bgr, report, force_gmm)
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+# Which correction enhance() applies: 'light' sets brightness and contrast from
+# the photo's own light and keeps colour (adjust_light); 'gmm' is the grayscale
+# denoise / glare inpaint / contrast / sharpen chain (enhance_for_ocr).
+ENHANCER = os.environ.get('FOTOMATES_ENHANCER', 'light').strip().lower()
+if ENHANCER not in ('light', 'gmm'):
+    raise ValueError(f"FOTOMATES_ENHANCER must be 'light' or 'gmm', not {ENHANCER!r}")
+
+
+def enhance(bgr: np.ndarray, report: dict | None = None) -> np.ndarray:
+    """The photo corrected by the chosen ENHANCER."""
+    if ENHANCER == 'gmm':
+        return enhance_for_ocr(bgr, report)
+    return adjust_light(bgr)
+
 
 
 _GMM_WARNED = set()

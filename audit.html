@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FotoMates · Audit results</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f3f6fa;color:#172033;font:16px Arial,sans-serif}
+main{max-width:1240px;margin:5vh auto;padding:24px}
+h1{margin:8px 0}h2{font-size:22px;margin:28px 0 12px}
+p,.muted{color:#58657a;line-height:1.5}
+a{color:#1769e0}
+.brand{color:#1769e0;font-weight:bold;letter-spacing:2px;font-size:13px}
+.panel{background:white;border:1px solid #dbe3ee;border-radius:14px;padding:18px;margin:16px 0}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:16px 0}
+.tile{background:white;border:1px solid #dbe3ee;border-radius:12px;padding:14px}
+.tile b{display:block;font:700 26px Arial,sans-serif;margin-top:6px;font-variant-numeric:tabular-nums}
+.tile.good b{color:#1f7a3a}.tile.bad b{color:#a22d2d}.tile.warn b{color:#8a5a00}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{padding:8px 10px;border-bottom:1px solid #e6ecf4;text-align:left;white-space:nowrap}
+th{background:#f7f9fc;color:#3a4860;font-weight:bold;position:sticky;top:0}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tbody tr:hover{background:#f4f8ff}
+tr.pick{cursor:pointer}tr.chosen{background:#edf5ff}
+tfoot td{font-weight:bold;border-top:2px solid #dbe3ee}
+.yes{color:#1f7a3a;font-weight:bold}.no{color:#a22d2d;font-weight:bold}
+td.value{font:700 15px monospace}
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+select,input{font:inherit;padding:9px 10px;border:1px solid #b9c6d8;border-radius:8px;background:white;color:inherit}
+button,.link{display:inline-block;padding:10px 16px;border:0;border-radius:8px;background:#1769e0;color:white;font-weight:bold;cursor:pointer;text-decoration:none;font:inherit;font-weight:bold}
+.secondary{background:#e5edf8;color:#234b80}
+button:disabled{opacity:.5;cursor:default}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tabs button{background:#e5edf8;color:#234b80}
+.tabs button[aria-pressed="true"]{background:#1769e0;color:white}
+.error{color:#a22d2d}
+code{background:#eef2f7;padding:2px 6px;border-radius:5px}
+</style></head><body><main>
+<div class="brand">FOTOMATES</div><h1>Audit results</h1>
+<p><a href="/">← Read meter photos</a></p>
+<p class="muted" id="meta">Loading…</p>
+<div id="empty" class="panel" hidden><p>No audit results yet. Read a folder of photos first:</p>
+<p><code>python audit_readings.py read "D:\photos\2026-08"</code></p></div>
+
+<section id="content" hidden>
+<div class="tiles" id="tiles"></div>
+
+<h2>Per month</h2>
+<p class="muted">Click a month to see only its photos below. The page refreshes every 30 seconds while a run is saving results.</p>
+<div class="panel scroll"><table id="months"><thead><tr>
+<th>Month</th><th class="num">Photos</th><th class="num">Read correctly</th><th class="num">Mismatch</th>
+<th class="num">Missing reading</th><th class="num">No saved reading</th><th class="num">Failed</th>
+<th class="num">% correct</th><th class="num">Contracts</th><th class="num">Seconds / photo</th>
+</tr></thead><tbody></tbody><tfoot></tfoot></table></div>
+
+<h2>Photos</h2>
+<div class="panel">
+<div class="toolbar">
+<div class="tabs" id="tabs" role="group" aria-label="List">
+<button data-kind="mismatches" aria-pressed="true">Mismatches</button>
+<button data-kind="missing" aria-pressed="false">Missing / failed</button>
+<button data-kind="duplicates" aria-pressed="false">Duplicates</button>
+<button data-kind="all" aria-pressed="false">All</button>
+</div>
+<label>Month <select id="month"><option value="">All months</option></select></label>
+<input id="contract" placeholder="Contract, e.g. AL0000001" aria-label="Contract">
+<button class="secondary" id="find">Find</button>
+<a class="link secondary" id="export">Download CSV</a>
+</div>
+<p class="muted" id="listInfo"></p>
+<div class="scroll"><table id="rows"><thead></thead><tbody></tbody></table></div>
+<div class="toolbar" style="margin-top:12px"><button class="secondary" id="prev">Previous</button><button class="secondary" id="next">Next</button><span class="muted" id="pageInfo"></span></div>
+</div>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const escape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=v=>v==null?'–':typeof v==='number'?v.toLocaleString():escape(v);
+const NUMERIC=new Set(['photos','read_correctly','mismatch','missing_reading','no_saved_reading','failed','percent_correct','contracts','seconds_per_photo','score','seconds','decimals_stripped']);
+const LABELS={picture_name:'Picture',contract_id:'Contract',date:'Date',month:'Month',register:'Register',saved_reading:'Stored in system',read_reading:'Read from photo',all_digits_read:'All digits read',decimals_stripped:'Decimals stripped',match:'Match',status:'Status',score:'Score',seconds:'Seconds',model:'Model',error:'Error',photos:'Photos',retake:'Retake',read_at:'Read at'};
+let state={kind:'mismatches',month:'',contract:'',page:0};
+
+async function api(url){const r=await fetch(url);const d=await r.json();if(!r.ok)throw Error(d.error||'Request failed');return d}
+
+async function loadOverview(){
+  const d=await api('/api/audit');
+  $('meta').textContent=`Model: ${d.model} · Results: ${d.database}`;
+  $('empty').hidden=d.available&&d.months.length>0;$('content').hidden=!$('empty').hidden;
+  if($('empty').hidden===false)return;
+  const sum=k=>d.months.reduce((t,m)=>t+(m[k]||0),0);
+  const photos=sum('photos'),ok=sum('read_correctly'),judged=ok+sum('mismatch')+sum('missing_reading');
+  const pct=judged?(100*ok/judged).toFixed(2)+'%':'–';
+  $('tiles').innerHTML=[['Photos read',photos,''],['Read correctly',ok,'good'],['Mismatch',sum('mismatch'),'bad'],
+    ['Missing reading',sum('missing_reading'),'warn'],['Failed',sum('failed'),'warn'],['% correct',pct,'good']]
+    .map(([l,v,c])=>`<div class="tile ${c}">${l}<b>${fmt(v)}</b></div>`).join('');
+  const cols=['month','photos','read_correctly','mismatch','missing_reading','no_saved_reading','failed','percent_correct','contracts','seconds_per_photo'];
+  $('months').tBodies[0].innerHTML=d.months.map(m=>`<tr class="pick${m.month===state.month?' chosen':''}" data-month="${escape(m.month)}">`+
+    cols.map(c=>`<td class="${c==='month'?'':'num'}">${fmt(m[c])}</td>`).join('')+'</tr>').join('');
+  $('months').tFoot.innerHTML=d.months.length>1?`<tr><td>All months</td><td class="num">${fmt(photos)}</td><td class="num">${fmt(ok)}</td><td class="num">${fmt(sum('mismatch'))}</td><td class="num">${fmt(sum('missing_reading'))}</td><td class="num">${fmt(sum('no_saved_reading'))}</td><td class="num">${fmt(sum('failed'))}</td><td class="num">${pct}</td><td></td><td></td></tr>`:'';
+  $('months').querySelectorAll('tr.pick').forEach(tr=>tr.onclick=()=>{state.month=tr.dataset.month===state.month?'':tr.dataset.month;state.page=0;$('month').value=state.month;loadOverview();loadRows()});
+  const current=$('month').value;
+  $('month').innerHTML='<option value="">All months</option>'+d.months.map(m=>`<option value="${escape(m.month)}">${escape(m.month)}</option>`).join('');
+  $('month').value=current;
+}
+
+function query(){const q=new URLSearchParams({kind:state.kind,month:state.month,contract:state.contract,page:state.page});return q.toString()}
+
+async function loadRows(){
+  $('export').href='/api/audit/export?'+query();
+  try{
+    const d=await api('/api/audit/rows?'+query());
+    $('rows').tHead.innerHTML='<tr>'+d.columns.map(c=>`<th class="${NUMERIC.has(c)?'num':''}">${LABELS[c]||escape(c)}</th>`).join('')+'</tr>';
+    const mi=d.columns.indexOf('match');
+    $('rows').tBodies[0].innerHTML=d.rows.length?d.rows.map(r=>'<tr>'+r.map((v,i)=>{const c=d.columns[i];
+      const cls=c==='match'?v:c==='read_reading'?'value '+r[mi]:c==='saved_reading'?'value':NUMERIC.has(c)?'num':'';
+      const shown=c==='decimals_stripped'&&v==null&&r[d.columns.indexOf('status')]==='no_saved_reading'?'unknown (no stored reading)':fmt(v);
+      return `<td class="${cls}">${shown}</td>`}).join('')+'</tr>').join('')
+      :`<tr><td colspan="${d.columns.length}" class="muted">Nothing here${state.month?' for '+escape(state.month):''}${state.contract?' for contract '+escape(state.contract):''}.</td></tr>`;
+    $('prev').disabled=d.page===0;$('next').disabled=!d.has_more;
+    const from=d.page*d.page_size;$('pageInfo').textContent=d.rows.length?`Rows ${(from+1).toLocaleString()}–${(from+d.rows.length).toLocaleString()}`:'';
+    $('listInfo').textContent={mismatches:'Both readings present, but the one read from the photo is not the one saved in the system.',
+      missing:'No reading could be taken from the photo, the file name has no stored reading (so the decimals cannot be told), or the read failed (run the same folder again to retry failed ones).',
+      duplicates:'The same contract and register photographed more than once in the same month.',all:'Every photo read.'}[state.kind]
+      +' Read from photo: the consumption with no leading zeros and its decimals stripped, decimals = (digits read − leading zeros) − (⌊log10(stored)⌋ + 1).';
+  }catch(e){$('listInfo').innerHTML=`<span class="error">${escape(e.message)}</span>`}
+}
+
+$('tabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{state.kind=b.dataset.kind;state.page=0;
+  $('tabs').querySelectorAll('button').forEach(x=>x.setAttribute('aria-pressed',String(x===b)));loadRows()});
+$('month').onchange=()=>{state.month=$('month').value;state.page=0;loadOverview();loadRows()};
+$('find').onclick=()=>{state.contract=$('contract').value.trim();state.page=0;loadRows()};
+$('contract').onkeydown=e=>{if(e.key==='Enter')$('find').click()};
+$('prev').onclick=()=>{state.page=Math.max(0,state.page-1);loadRows()};
+$('next').onclick=()=>{state.page++;loadRows()};
+
+loadOverview().then(()=>{if(!$('content').hidden)loadRows()}).catch(e=>{$('meta').innerHTML=`<span class="error">${escape(e.message)}</span>`});
+setInterval(()=>{if(document.visibilityState==='visible')loadOverview().catch(()=>{})},30000);
+</script>
+</body></html>
