@@ -1,4 +1,5 @@
 import base64
+import functools
 import itertools
 import json
 import math
@@ -196,6 +197,15 @@ WORKERS_PER_SLOT = int(os.environ.get('FOTOMATES_WORKERS_PER_SLOT', '2'))
 PHOTO_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".bmp": "image/bmp"}
 
 
+@functools.lru_cache(maxsize=512)
+def photo_bytes(path: Path) -> bytes:
+    """A photo file's bytes, read once: judging its quality, sending it and a
+    second, enlarged read all use them. On the file share a read costs seconds,
+    and it was made two or three times per photo. The last 512 photos are kept
+    (~35 MB), more than the photos in flight."""
+    return path.read_bytes()
+
+
 def photo_data_url(path: Path) -> str:
     """The photo file exactly as it is on disk, as a data URL: no decoding,
     no enhancement, no resizing, no re-encoding."""
@@ -203,7 +213,7 @@ def photo_data_url(path: Path) -> str:
     if kind is None:
         raise ValueError(f"{path.suffix or 'no extension'}: the model server reads "
                          + ", ".join(PHOTO_TYPES) + " photos")
-    return f"data:{kind};base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{kind};base64," + base64.b64encode(photo_bytes(path)).decode("ascii")
 
 
 def png_data_url(pixels: np.ndarray) -> str:
@@ -215,7 +225,7 @@ def png_data_url(pixels: np.ndarray) -> str:
 
 
 def decode_image(path: Path) -> np.ndarray:
-    pixels = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+    pixels = cv2.imdecode(np.frombuffer(photo_bytes(path), dtype=np.uint8), cv2.IMREAD_COLOR)
     if pixels is None:
         raise ValueError("Could not decode image")
     return pixels
@@ -612,6 +622,77 @@ _USER_PROMPT = (
     "TYPE: DIGITAL or MECHANICAL\n"
     "ROLLING: position:lower-upper for each turning wheel, comma separated, or NONE\n"
     "DECIMALS: visually marked fractional wheel count, 0 when none, or UNKNOWN.")
+
+# The same rules restructured (role and output contract in the system prompt;
+# task, what to read, what to ignore, digit shapes, decimals, rolling wheels and
+# when unsure in the user prompt), each said once: about half the tokens, and
+# TYPE first so the lines after it follow from it. The default;
+# FOTOMATES_PROMPT=full goes back to the prompt above.
+_COMPACT_SYSTEM_PROMPT = (
+    "You read electricity meter registers from photos. Answer with exactly these six "
+    "lines and nothing else:\n"
+    "TYPE: DIGITAL (LCD or LED segments) or MECHANICAL (printed number wheels)\n"
+    "CELLS: MECHANICAL: one digit per wheel, left to right, space separated; DIGITAL: NONE\n"
+    "WINDOWS: MECHANICAL: one word per wheel for its window colour (dark, white, red, "
+    "orange, yellow, other), with -box when it has its own frame; DIGITAL: NONE\n"
+    "READING: every digit of the main row as one string with no dot or comma, or "
+    "UNREADABLE, or NO METER\n"
+    "ROLLING: MECHANICAL wheels caught between two numbers as position:lower-upper, "
+    "comma separated; otherwise NONE\n"
+    "DECIMALS: MECHANICAL: number of marked fractional wheels at the right end, 0 if "
+    "none; DIGITAL or unclear: UNKNOWN")
+_COMPACT_USER_PROMPT = (
+    "TASK\n"
+    "Read the consumption register: the main row of the largest digits on the display.\n"
+    "\n"
+    "WHAT TO READ\n"
+    "- Every digit cell of that row, first to last, one digit per cell: leading zeros, and "
+    "the last cell or two even when boxed, coloured, smaller, faint or under glare. Never "
+    "skip or repeat a cell: READING has as many digits as the row has cells.\n"
+    "- MECHANICAL: only the printed digits on the wheels inside the counter window, "
+    "including a partly visible or turning last wheel; CELLS and READING hold the same "
+    "digits in the same order.\n"
+    "\n"
+    "WHAT TO IGNORE\n"
+    "- The register code: a short group of smaller digits, often joined by dots, at the "
+    "left or top edge of the display. Recognise it by size, dots and place, never by "
+    "value. The row's own leading zeros are as large as the row and belong to it.\n"
+    "- A small 1 or index before the row, tariff or register numbers, units, serial, model "
+    "code, barcode, year and anything printed outside the display.\n"
+    "- Handwritten, painted or sticker numbers anywhere (face, glass, cover, label), even "
+    "when larger, darker or closer to the camera than the wheels.\n"
+    "\n"
+    "DIGIT SHAPES (read each digit from its own strokes, not from what you expect)\n"
+    "- 7 has no lower-left stroke and no bottom; 9 has a top-left stroke and a bottom. 8 "
+    "has the middle bar that 0 lacks. 1 is a single stroke on the right.\n"
+    "- 5 or 9: a 9 closes its top into a loop at the upper right; a 5 has a flat top bar "
+    "and a stroke down the left only, open at the upper right. Write 9 only when that "
+    "upper loop is closed.\n"
+    "- 5 or 6: a 6 closes its lower half on the left; a 5 is open at the lower left.\n"
+    "\n"
+    "DECIMALS (MECHANICAL)\n"
+    "- Write WINDOWS first. Wheels at the right end are fractional only when something "
+    "sets them apart from the wheels before them: a different window colour (red, pink, "
+    "magenta, orange, yellow, or white where the others are dark, or the reverse; glare "
+    "can make red look pale), a frame of their own, a decimal point or comma, or a 0.1, "
+    "x0.1 or 1/10 scale above them. Otherwise DECIMALS: 0; being last is no evidence. "
+    "Keep fractional wheels in READING.\n"
+    "- Examples: black wheels 0 4 7 2 9 3 then a red wheel 6: READING: 0472936, "
+    "DECIMALS: 1. A dark band 0 4 2 9 6 then a 7 in its own white box: WINDOWS: dark dark "
+    "dark dark dark white-box, READING: 042967, DECIMALS: 1. Black wheels 3 8 1 2 5 6, "
+    "all alike: READING: 381256, DECIMALS: 0.\n"
+    "\n"
+    "ROLLING (MECHANICAL)\n"
+    "- A wheel showing parts of two numbers: write the lower in READING (9 when it turns "
+    "from 9 to 0) and list it as its position in READING from the left, then the two "
+    "numbers, e.g. 6:6-7.\n"
+    "\n"
+    "WHEN UNSURE\n"
+    "- Too blurred, dim or washed out to read every cell: UNREADABLE. No meter in the "
+    "photo: NO METER. Never guess a digit and never shorten the reading to fit a length "
+    "you expect.")
+if os.environ.get('FOTOMATES_PROMPT', 'compact') == 'compact':
+    _SYSTEM_PROMPT, _USER_PROMPT = _COMPACT_SYSTEM_PROMPT, _COMPACT_USER_PROMPT
 
 
 def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: float = 1.0) -> OcrResult:

@@ -8,8 +8,10 @@ from datetime import datetime, timezone
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import sqlite3
+import threading
 import time
 from evaluation import GROUPS as EVALUATION_GROUPS, SCORE_THRESHOLD, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, RETAKE_SCORE, WORKERS_PER_SLOT, _reading_digits, ocr_image,
@@ -114,12 +116,42 @@ def photos(folders):
     stack = [Path(folder) for folder in folders]
     excluded = processing_exclusions()
     while stack:
-        with os.scandir(stack.pop()) as entries:
+        folder = stack.pop()
+        ready = []
+        # Finish and close the network directory listing before yielding photos.
+        # The consumer can spend hours awaiting inference; keeping an SMB/CIFS
+        # enumeration open throughout that work risks an incomplete listing.
+        with os.scandir(folder) as entries:
             for entry in entries:
                 if entry.is_dir(follow_symlinks=False):
                     stack.append(Path(entry.path))
                 elif entry.name not in excluded and Path(entry.name).suffix.lower() in PHOTO_TYPES:
-                    yield Path(entry.path)
+                    ready.append(Path(entry.path))
+        print(f'Source scan: {folder}: {len(ready)} eligible photos', flush=True)
+        yield from ready
+
+
+def prefetch(iterable, size=20000):
+    """The items of iterable, produced in a thread of their own: the next folder
+    on the share is listed while the photos of the one before are being read, so
+    the model server is not left idle for the minutes a 100 000-file listing
+    takes. An error of the listing is raised here, where the caller handles it."""
+    items, end = queue.Queue(size), object()
+
+    def fill():
+        try:
+            for item in iterable:
+                items.put(item)
+        except BaseException as exc:
+            items.put(exc)
+        finally:
+            items.put(end)
+
+    threading.Thread(target=fill, name='folder-listing', daemon=True).start()
+    while (item := items.get()) is not end:
+        if isinstance(item, BaseException):
+            raise item
+        yield item
 
 
 def unread(db, paths, retry_errors=True, only_failed=False):
@@ -207,6 +239,8 @@ def read_best(path, saved, model=None):
     a second read was made) and 'seconds' (model time of every read made)."""
     first = read_scored(path, saved, model)
     first.update(reread=False, seconds=first['result'].reading_seconds or 0.0)
+    if REREAD_SCALE == 1:
+        return first  # no resizing: the same image read again gives the same answer (temperature 0)
     if first['score'] is not None and first['score'] >= REREAD_BELOW:
         return first
     if extract_no_meter(first['result'].text):
@@ -276,14 +310,47 @@ def command_read(args):
     interruption = None
     last_report_count = 0
 
-    def checkpoint_reports():
-        nonlocal last_report_count
+    progress_dir = Path(args.word_dir) / 'progress'
+    # Checkpoint reports are written in a thread of their own, with their own
+    # database connection (WAL lets it read while results are being written):
+    # exporting the whole database (seconds) no longer stops photos being sent.
+    reporter = ThreadPoolExecutor(max_workers=1, thread_name_prefix='reports')
+    report_job = None
+
+    def write_reports(connection):
         try:
-            export_reports(db, Path(args.word_dir) / 'progress', args.month, full=True, quiet=True)
-            last_report_count = count
-            print(f'Reports saved: {Path(args.word_dir) / "progress"} (all saved results in this database for the selected month)', flush=True)
+            export_reports(connection, progress_dir, args.month, full=True, quiet=True)
+            print(f'Reports saved: {progress_dir} (all saved results in this database for the selected month)', flush=True)
         except Exception as exc:
             print(f'Report export could not finish: {exc}. Results remain saved in {args.db}.', flush=True)
+
+    def reader_connection():
+        """A connection the export thread can read from. A file database is
+        opened again; an in-memory one (--db :memory:) exists only inside this
+        connection, so it is copied instead."""
+        if str(args.db) in (':memory:', '') or str(args.db).startswith('file::memory'):
+            copy = sqlite3.connect(':memory:', check_same_thread=False)
+            db.backup(copy)
+            return copy
+        return sqlite3.connect(args.db, check_same_thread=False)
+
+    def background_reports(reader):
+        try:
+            write_reports(reader)
+        finally:
+            reader.close()
+
+    def checkpoint_reports():
+        nonlocal last_report_count, report_job
+        if report_job is not None and not report_job.done():
+            return  # the previous export is still writing; a later checkpoint catches up
+        last_report_count = count
+        try:
+            reader = reader_connection()
+        except Exception as exc:
+            print(f'Report export could not start: {exc}. Results remain saved in {args.db}.', flush=True)
+            return
+        report_job = reporter.submit(background_reports, reader)
 
     def listed(paths):
         for path in paths:
@@ -331,7 +398,7 @@ def command_read(args):
             # --only-failed: the photos with a technical error, found by name; no
             # listing of the share, and nothing new is read.
             paths = (listed(failed_photos(db, args.folders)) if args.only_failed else
-                     unread(db, listed(photos(args.folders)), retry_errors=not args.skip_errors))
+                     unread(db, listed(prefetch(photos(args.folders))), retry_errors=not args.skip_errors))
             for path in paths:
                 # Save and print what has finished as it finishes: with many workers
                 # the queue is rarely full, so waiting for that would hold every result.
@@ -349,7 +416,8 @@ def command_read(args):
                 done, pending = wait(pending, return_when=FIRST_COMPLETED)
                 collect(done)
     db.commit()
-    checkpoint_reports()
+    reporter.shutdown(wait=True)  # a checkpoint still writing finishes before the final one
+    write_reports(db)
     elapsed = time.monotonic() - started
     print(f'{"stopped safely" if interruption else "done"}: {count} photos in {elapsed:.0f} s'
           + (f' ({count / elapsed:.2f} photos/s)' if elapsed else ''), flush=True)
