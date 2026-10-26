@@ -91,7 +91,7 @@ class _Server:
             base_url=url,
             api_key=OCR_API_KEY,
             timeout=None,  # no time limit: a photo waits as long as the server needs
-            max_retries=0,  # complete() owns retries; the SDK would stack its own on top
+            max_retries=int(os.environ.get('FOTOMATES_API_RETRIES', '2')),
             http_client=httpx.Client(timeout=None, transport=httpx.HTTPTransport(socket_options=_KEEPALIVE),
                                      limits=httpx.Limits(max_connections=1000, max_keepalive_connections=100)),
         )
@@ -147,8 +147,7 @@ def _is_model_loading(error: Exception) -> bool:
 
 
 def complete(server=None, **request):
-    """One request per photo, no retries: a failed read is reported as failed.
-    The one wait is for a model server still loading its model at start."""
+    """SDK retries transient transport/status errors; wait for model loading too."""
     loading_deadline = time.monotonic() + _MODEL_LOADING_WAIT
     while True:
         try:
@@ -510,8 +509,20 @@ class OcrFailure(Exception):
 
 
 def _failure_reason(error: Exception) -> str:
-    
-    return f'{type(error).__name__}: {error}'
+    # APIConnectionError wraps the useful HTTPX/socket error in __cause__.
+    # Keep this in console/CSV evidence even when nothing reaches Docker logs.
+    chain, seen = [], set()
+    current = error
+    while current is not None and id(current) not in seen and len(chain) < 5:
+        seen.add(id(current))
+        message = str(current)
+        key = globals().get('OCR_API_KEY', '')
+        if key and key != 'EMPTY':
+            message = message.replace(key, '[redacted]')
+        message = re.sub(r'(https?://)[^/\s@]+@', r'\1[redacted]@', message)
+        chain.append(f'{type(current).__name__}: {message[:300]}')
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    return ' <- '.join(chain)
 
 
 _SYSTEM_PROMPT = (

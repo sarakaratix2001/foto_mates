@@ -220,6 +220,42 @@ def failed_photos(db, folders):
         print(f'{missing} failed photo(s) not found in the given folders', flush=True)
 
 
+def csv_photos(filename):
+    """Explicit retry paths, without scanning folders or reading a saved database."""
+    seen = set()
+    excluded = processing_exclusions()
+    with Path(filename).open(encoding='utf-8-sig', newline='') as source:
+        reader = csv.DictReader(source)
+        if not {'picture_name', 'source_path'}.issubset(reader.fieldnames or []):
+            raise ValueError('Retry CSV requires picture_name and source_path columns')
+        for line, row in enumerate(reader, 2):
+            path = Path(row['source_path'])
+            name = row['picture_name']
+            if not row['source_path'] or not path.is_absolute() or path.name != name:
+                raise ValueError(f'Invalid source_path or picture_name on retry CSV line {line}')
+            if path.suffix.lower() not in PHOTO_TYPES:
+                raise ValueError(f'Unsupported photo extension on retry CSV line {line}')
+            if name in seen or name in excluded:
+                continue
+            seen.add(name)
+            yield path
+
+
+def record_retry_failure(filename, row):
+    """Persist failed paths independently of the optional in-memory database."""
+    filename = Path(filename)
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    fields = ['picture_name', 'source_path', 'reason', 'error', 'read_at', 'status']
+    header = not filename.exists() or filename.stat().st_size == 0
+    with filename.open('a', encoding='utf-8-sig' if header else 'utf-8', newline='') as output:
+        writer = csv.DictWriter(output, fields)
+        if header:
+            writer.writeheader()
+        writer.writerow({key: ('technical_error' if key == 'reason' else row.get(key, '')) for key in fields})
+        output.flush()
+        os.fsync(output.fileno())
+
+
 REREAD_BELOW = float(os.environ.get('FOTOMATES_REREAD_BELOW', '0.7'))
 REREAD_SCALE = float(os.environ.get('FOTOMATES_REREAD_SCALE', '2'))
 
@@ -268,7 +304,7 @@ def read_one(path, month, model=None):
     except Exception as exc:
         return dict(row, model=model_backend(model).model, picture_name=path.name, extracted_reading=None, extracted_whole=None,
                     extracted_decimals=None, match='no', status='error', score=None, retake=None,
-                    seconds=round(time.monotonic() - started, 2), error=str(exc)[:500])
+                    seconds=round(time.monotonic() - started, 2), error=str(exc)[:2000], source_path=str(path.absolute()))
     reading = _reading_digits(result.text) or None  # as read: leading zeros kept
     if extract_no_meter(result.text):
         status = 'no_meter'
@@ -316,6 +352,8 @@ def command_read(args):
     last_report_count = 0
 
     progress_dir = Path(args.word_dir) / 'progress'
+    failure_csv = progress_dir / 'retry_failures.csv'
+    print(f'Technical failures are saved immediately to: {failure_csv}', flush=True)
     # Checkpoint reports are written in a thread of their own, with their own
     # database connection (WAL lets it read while results are being written):
     # exporting the whole database (seconds) no longer stops photos being sent.
@@ -369,6 +407,8 @@ def command_read(args):
             row = future.result()
             save(db, row)
             db.commit()  # a printed result is already durable, even after a disconnect
+            if row['status'] == 'error':
+                record_retry_failure(failure_csv, row)
             saved_names_so_far.add(row['picture_name'])
             count += 1
             matched += row['match'] == 'yes'
@@ -402,8 +442,12 @@ def command_read(args):
         try:
             # --only-failed: the photos with a technical error, found by name; no
             # listing of the share, and nothing new is read.
-            paths = (listed(failed_photos(db, args.folders)) if args.only_failed else
-                     unread(db, listed(prefetch(photos(args.folders))), retry_errors=not args.skip_errors))
+            if getattr(args, 'files_csv', None):
+                print(f'Reading only explicit paths in: {args.files_csv}', flush=True)
+                paths = unread(db, listed(csv_photos(args.files_csv)), retry_errors=not args.skip_errors)
+            else:
+                paths = (listed(failed_photos(db, args.folders)) if args.only_failed else
+                         unread(db, listed(prefetch(photos(args.folders))), retry_errors=not args.skip_errors))
             for path in paths:
                 # Save and print what has finished as it finishes: with many workers
                 # the queue is rarely full, so waiting for that would hold every result.
@@ -741,7 +785,8 @@ def main():
     commands = parser.add_subparsers(dest='command', required=True)
 
     read = commands.add_parser('read', help='read photos and store the results')
-    read.add_argument('folders', nargs='+')
+    read.add_argument('folders', nargs='*')
+    read.add_argument('--files-csv', help='read only paths in a CSV with picture_name and source_path; no folder scan')
     read.add_argument('--month', help='YYYY-MM for photos whose name carries no date')
     read.add_argument('--workers', type=int, help='photos read at once (default: from the model server)')
     read.add_argument('--model', choices=list(MODEL_BACKENDS), default='default',
@@ -775,6 +820,11 @@ def main():
     report.set_defaults(run=command_report)
 
     args = parser.parse_args()
+    if args.command == 'read':
+        if not args.folders and not args.files_csv:
+            parser.error('read requires photo folders or --files-csv')
+        if args.files_csv and (args.folders or args.only_failed):
+            parser.error('--files-csv cannot be combined with folders or --only-failed')
     args.run(args)
 
 
