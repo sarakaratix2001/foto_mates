@@ -15,7 +15,7 @@ import threading
 import time
 from evaluation import GROUPS as EVALUATION_GROUPS, SCORE_THRESHOLD, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, RETAKE_SCORE, WORKERS_PER_SLOT, _reading_digits, ocr_image,
-                              server_slots, extract_no_meter, score_reading)
+                              server_slots, extract_blank, extract_no_meter, score_reading)
 
 NAME = re.compile(r'^(?P<contract>[^_]+)_(?P<stamp>\d{14})_(?P<operator>[^_]*)_(?P<reading>\d+)__'
                   r'(?P<register>[^_]+)')
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS readings (
     extracted_whole   TEXT,     -- the consumption read: no leading zeros, decimals stripped
     extracted_decimals INTEGER, -- how many digits were stripped as decimals
     match             TEXT NOT NULL,  -- yes / no
-    status            TEXT NOT NULL,  -- done / missing / no_meter / no_saved_reading / error
+    status            TEXT NOT NULL,  -- done / missing / no_meter / blank / no_saved_reading / error
     score             REAL,
     retake            INTEGER,
     seconds           REAL,
@@ -257,7 +257,8 @@ def record_retry_failure(filename, row):
 
 
 REREAD_BELOW = float(os.environ.get('FOTOMATES_REREAD_BELOW', '0.7'))
-REREAD_SCALE = float(os.environ.get('FOTOMATES_REREAD_SCALE', '2'))
+# Every small photo is already read enlarged to FOTOMATES_MIN_SIDE (2x for 240x400), so the reread goes further.
+REREAD_SCALE = float(os.environ.get('FOTOMATES_REREAD_SCALE', '3'))
 
 
 def read_scored(path, saved, model=None, scale=1.0):
@@ -306,7 +307,9 @@ def read_one(path, month, model=None):
                     extracted_decimals=None, match='no', status='error', score=None, retake=None,
                     seconds=round(time.monotonic() - started, 2), error=str(exc)[:2000], source_path=str(path.absolute()))
     reading = _reading_digits(result.text) or None  # as read: leading zeros kept
-    if extract_no_meter(result.text):
+    if extract_blank(result.text):
+        status = 'blank'
+    elif extract_no_meter(result.text):
         status = 'no_meter'
     elif not reading:
         status = 'missing'
@@ -415,7 +418,8 @@ def command_read(args):
             failed += row['status'] == 'error'
             model_seconds += row['seconds'] or 0
             if args.verbose:
-                result = ('MATCH' if row['match'] == 'yes' else 'MISMATCH') if row['status'] == 'done' else row['status'].upper()
+                result = (('MATCH' if row['match'] == 'yes' else 'MISMATCH') if row['status'] == 'done' else
+                          {'no_meter': 'NO_METER_FOUND'}.get(row['status'], row['status'].upper()))
                 score = '-' if row['score'] is None else f"{row['score']:.3f}"
                 elapsed = time.monotonic() - started
                 print(f"[{count} this run | {len(saved_names_so_far)} saved] {row['picture_name']} "
@@ -504,7 +508,7 @@ def write_word_report(db, folders, names, read_now, out_dir):
     from docx import Document  # python-docx; only this report needs it
 
     rows = folder_rows(db, sorted(set(names)))
-    groups = evaluate(dict(row, no_meter=row['status'] == 'no_meter') for row in rows)
+    groups = evaluate(dict(row, no_meter=row['status'] == 'no_meter', blank=row['status'] == 'blank') for row in rows)
     errors = {row['name']: row['error'] for row in rows if row['status'] == 'error'}
     now = datetime.now()
 
@@ -580,6 +584,7 @@ def summary(db, month=None):
                SUM(status = 'done' AND match = 'no' AND score IS NULL) AS mismatch_no_score,
                SUM(status = 'missing') AS missing_reading,
                SUM(status = 'no_meter') AS no_meter,
+               SUM(status = 'blank') AS blank,
                SUM(status = 'no_saved_reading') AS no_saved_reading,
                SUM(status = 'error') AS failed,
                ROUND(100.0 * SUM(match = 'yes') / NULLIF(SUM(status IN ('done', 'missing')), 0), 2)
@@ -633,7 +638,7 @@ def list_query(kind, month=None, contract=None):
                 'ORDER BY month, contract_id', params)
     if kind == 'missing':
         return (f"SELECT {_PICKED}, error FROM readings "
-                f"WHERE status IN ('missing', 'no_meter', 'error', 'no_saved_reading'){also} "
+                f"WHERE status IN ('missing', 'no_meter', 'blank', 'error', 'no_saved_reading'){also} "
                 'ORDER BY status, month, contract_id', params)
     where = ' WHERE ' + ' AND '.join(filters) if filters else ''
     return (f'SELECT month, {_PICKED}, retake, error, read_at FROM readings{where} '
@@ -647,11 +652,6 @@ _LOG_LINE = re.compile(r'^\[\d+(?: this run \| \d+ saved)?\] (?P<name>\S+) \| sa
 
 
 def command_import_log(args):
-    """Put the results printed by `read --verbose` (a run's terminal output saved
-    to a file) into the database, so a later `read` of the same folders skips
-    those photos. Photos that failed are left out, so they are read again;
-    photos already in the database are kept as they are. The consumption is
-    worked out again from the raw digits by the current rule."""
     db = connect(args.db)
     known = {name for (name,) in db.execute('SELECT picture_name FROM readings')}
     added = failed = present = 0
@@ -672,7 +672,7 @@ def command_import_log(args):
             visual = re.search(r'\| visual decimals=(\d+|-)', line)
             visual_decimals = int(visual[1]) if visual and visual[1] != '-' else None
             whole, decimals, match = split_decimals(raw, row['saved_reading'], visual_decimals)
-            status = {'MATCH': 'done', 'MISMATCH': 'done'}.get(result, result.lower())
+            status = {'MATCH': 'done', 'MISMATCH': 'done', 'NO_METER_FOUND': 'no_meter'}.get(result, result.lower())
             if status == 'done' and not row['saved_reading']:
                 status = 'no_saved_reading'
             score = None if m['score'] == '-' else float(m['score'])
@@ -733,6 +733,7 @@ def export_reports(db, out, month=None, full=False, quiet=False):
                extracted_decimals AS "Digits stripped", score AS "Score",
                CASE WHEN status = 'error' THEN 'Processing error'
                     WHEN status = 'no_meter' THEN 'No meter'
+                    WHEN status = 'blank' THEN 'Blank photo'
                     WHEN status = 'missing' THEN 'No readable digits'
                     WHEN status = 'no_saved_reading' THEN 'No saved reading'
                     WHEN match = 'yes' THEN 'Match'
@@ -748,7 +749,7 @@ def export_reports(db, out, month=None, full=False, quiet=False):
     for label, condition in (('high_score', 'score >= ?'), ('low_score', 'score < ?')):
         write_csv(out / f'mismatches_{label}.csv', db.execute(
             f'SELECT * FROM ({mismatch_sql}) WHERE {condition}', [*mismatch_params, SCORE_THRESHOLD]))
-    for label, status in (('no_digits', 'missing'), ('no_meter', 'no_meter'),
+    for label, status in (('no_digits', 'missing'), ('no_meter', 'no_meter'), ('blank', 'blank'),
                           ('no_saved_reading', 'no_saved_reading'), ('errors', 'error')):
         write_csv(out / f'{label}.csv', db.execute(
             f'SELECT month, {_PICKED}, error, read_at FROM readings WHERE status = ?' +

@@ -48,6 +48,8 @@ if _ENHANCE_MODE not in ('auto', 'always', 'never'):
     raise ValueError(f"FOTOMATES_ENHANCE must be 'auto', 'always' or 'never', not {_ENHANCE_MODE!r}")
 _ENHANCE_WHEN = tuple(flag.strip() for flag in os.environ.get(
     'FOTOMATES_ENHANCE_WHEN', 'is_low_contrast,is_dark,is_bright,has_glare').split(',') if flag.strip())
+# Shorter side, in pixels, a photo is enlarged to before it is read; 0 sends it at its own size.
+_MIN_SIDE = float(os.environ.get('FOTOMATES_MIN_SIDE', '480'))
 
 # The model's thinking mode is always off: a reading needs no reasoning text,
 # and thinking would cost hundreds of tokens per photo. Sent with every request.
@@ -68,13 +70,6 @@ OCR_API_KEY = os.environ.get('FOTOMATES_OCR_API_KEY', 'EMPTY')
 
 
 
-
-# TCP keep-alive on every connection to a model server: with no time limit a
-# photo waits as long as the server needs, but a connection that died (network
-# drop, server restart) would wait forever. A live server answers the probes
-# however busy it is; a dead one misses KEEPCNT of them, INTVL seconds apart,
-# after IDLE seconds of silence: the request then fails (re-read later with
-# --only-failed or "Re-read failed photos") instead of hanging.
 _KEEPALIVE = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)] + [
     (socket.IPPROTO_TCP, getattr(socket, option), value)
     for option, value in (('TCP_KEEPIDLE', 60), ('TCP_KEEPINTVL', 15), ('TCP_KEEPCNT', 4))
@@ -159,23 +154,16 @@ def complete(server=None, **request):
             raise
 
 
-# Timeout of the /slots request that counts a server's slots when a batch starts.
 _SLOTS_COUNT_TIMEOUT = float(os.environ.get('FOTOMATES_SLOTS_COUNT_TIMEOUT', '5'))
-# Time the warm-up request at start may take on each server.
-_WARM_UP_TIMEOUT = float(os.environ.get('FOTOMATES_WARM_UP_TIMEOUT', '60'))
 _TURN = itertools.count()  # which server of a model takes the next photo
 
 
-# Requests a server without a /slots endpoint (vLLM) runs at once, set by hand:
-# vLLM does not publish it, and its GPU memory, not --max-num-seqs, decides it
-# (vllm:num_requests_running on /metrics under full load shows the number).
+
 _SERVER_SLOTS = int(os.environ.get('FOTOMATES_SERVER_SLOTS', '0'))
+WORKERS_PER_SLOT = int(os.environ.get('FOTOMATES_WORKERS_PER_SLOT', '2'))
 
 
 def server_slots(servers: list | None = None) -> int | None:
-    """How many requests the model servers can work on at once, all together:
-    each server's /slots count (llama.cpp), else FOTOMATES_SERVER_SLOTS for it;
-    None when neither says."""
     counts = []
     for server in servers or SERVERS:
         try:
@@ -186,28 +174,16 @@ def server_slots(servers: list | None = None) -> int | None:
     return sum(counts) or None
 
 
-# Photos in flight per model slot, on a server that reports its slots: the
-# second one is prepared (file share, decode, enhance, encode) and queued at
-# the server while the slot is busy, so the slot never idles on file reading.
-WORKERS_PER_SLOT = int(os.environ.get('FOTOMATES_WORKERS_PER_SLOT', '2'))
-
-
 # The photo file types the model server reads as they are.
 PHOTO_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".bmp": "image/bmp"}
 
 
 @functools.lru_cache(maxsize=512)
 def photo_bytes(path: Path) -> bytes:
-    """A photo file's bytes, read once: judging its quality, sending it and a
-    second, enlarged read all use them. On the file share a read costs seconds,
-    and it was made two or three times per photo. The last 512 photos are kept
-    (~35 MB), more than the photos in flight."""
     return path.read_bytes()
 
 
 def photo_data_url(path: Path) -> str:
-    """The photo file exactly as it is on disk, as a data URL: no decoding,
-    no enhancement, no resizing, no re-encoding."""
     kind = PHOTO_TYPES.get(path.suffix.lower())
     if kind is None:
         raise ValueError(f"{path.suffix or 'no extension'}: the model server reads "
@@ -216,7 +192,6 @@ def photo_data_url(path: Path) -> str:
 
 
 def png_data_url(pixels: np.ndarray) -> str:
-    """An enhanced photo as lossless PNG: only a corrected photo is encoded."""
     ok, encoded = cv2.imencode(".png", pixels)
     if not ok:
         raise ValueError("Could not encode the enhanced photo")
@@ -230,7 +205,6 @@ def decode_image(path: Path) -> np.ndarray:
     return pixels
 
 
-# Without a READING line, the longest run of this many digits in the answer is the reading.
 _MAX_READING_DIGITS = int(os.environ.get('FOTOMATES_MAX_READING_DIGITS', '12'))
 _MIN_READING_DIGITS = int(os.environ.get('FOTOMATES_MIN_READING_DIGITS', '6'))
 
@@ -239,33 +213,17 @@ def _digit_count(reading: str) -> int:
     return sum(ch.isdigit() for ch in reading)
 
 
-# A register code: the small digits a register display shows beside the
-# consumption (1.8.0, 15.8.0, 2.8.1, ...). It is never part of the reading.
-# Three or more short groups joined by dots: a reading has at most one decimal
-# point, so this shape at the front is always a code.
 _DOTTED_CODE = re.compile(r"^(?:\d{1,2}[.,]){2,}\d{1,2}(?=[.,]|$)[.,]?")
-# The same code copied without its dots. An energy register is A.8.T (the 8 is
-# sometimes misread as 5-7), and the display pads the consumption with leading
-# zeros, so such a prefix followed by a zero and five more digits is a code glued
-# onto the reading (15800061724 -> 0061724), not the start of a real consumption.
 _GLUED_CODE = re.compile(r"^(?:1\d|[1-9])[5-8]\d(?=0\d{5})")
 
 
 def _strip_code(digits: str, code: str) -> str:
-    """The reading without a register code the model glued onto its front."""
     code_digits = re.sub(r"\D", "", code)
     if len(code_digits) >= 2 and digits.startswith(code_digits) \
             and len(digits) - len(code_digits) >= 4:
         return digits[len(code_digits):]
     glued = _GLUED_CODE.match(digits)
     return digits[glued.end():] if glued else digits
-
-
-def extract_reading(text: str) -> str:
-    reading = _reading_digits(text)
-    stripped = reading.lstrip("0")
-    return stripped or (reading and "0")
-
 
 def extract_device_type(text: str) -> str | None:
     types = re.findall(r"TYPE:[ \t]*\**[ \t]*(DIGITAL|MECHANICAL)", text, re.IGNORECASE)
@@ -275,10 +233,6 @@ def extract_device_type(text: str) -> str | None:
 
 
 def extract_window_decimals(text: str) -> int | None:
-    """Decimal wheels by the one rule: at the right end, a wheel whose digit is
-    smaller (-small) or whose window has another colour than most of the wheels
-    (WINDOWS: dark dark dark dark dark red gives 1; ... dark-small gives 1; a frame,
-    dot or printed 0.1 alone gives 0). None without one window word per digit."""
     lines = re.findall(r'^WINDOWS:[ \t]*([^\n]*)', text, re.IGNORECASE | re.MULTILINE)
     windows = lines[-1].lower().split() if lines else []
     digits = _reading_digits(text)
@@ -288,34 +242,17 @@ def extract_window_decimals(text: str) -> int | None:
     colour = max(set(colours), key=colours.count)  # the integer wheels' colour
     marked = [word.split('-')[0] != colour or 'small' in word.split('-')[1:] for word in windows]
     decimals = len(marked) - next((i + 1 for i in range(len(marked) - 1, -1, -1) if not marked[i]), 0)
-    # Only a short group after unmarked integer wheels: one odd wheel in the
-    # middle does not make every wheel after it a decimal.
     return decimals if decimals < len(windows) and not any(marked[:len(marked) - decimals]) else 0
 
 
-def extract_decimal_digits(text: str) -> int | None:
-    """Mechanical decimal wheels identified visually, never from the saved value:
-    from the WINDOWS line by the one rule (smaller digit or a box of another
-    colour); the model's DECIMALS answer only when WINDOWS is missing or does
-    not have one word per digit."""
-    if extract_device_type(text) != 'mechanical':
-        return None
-    answers = re.findall(r'^DECIMALS:[ \t]*(\d+|UNKNOWN)[ \t]*$', text, re.IGNORECASE | re.MULTILINE)
-    windows = extract_window_decimals(text)
-    if windows is not None:
-        count = windows
-    elif not answers or answers[-1].upper() == 'UNKNOWN':
-        count = None
-    else:
-        count = int(answers[-1])
-    digits = _reading_digits(text)
-    return count if count is not None and digits and 0 <= count < len(digits) else None
-
-
 def extract_no_meter(text: str) -> bool:
-    """True when the model answered that the photo shows no meter at all."""
     answers = re.findall(r"READING:[ \t]*\**[ \t]*([^\n*]+)", text or '', re.IGNORECASE)
     return bool(answers) and re.match(r"\s*NO[\s_-]*METER", answers[-1], re.IGNORECASE) is not None
+
+
+def extract_blank(text: str) -> bool:
+    answers = re.findall(r"READING:[ \t]*\**[ \t]*([^\n*]+)", text or '', re.IGNORECASE)
+    return bool(answers) and re.match(r"\s*BLANK\b", answers[-1], re.IGNORECASE) is not None
 
 
 def extract_rolling(text: str) -> list[dict]:
@@ -331,8 +268,7 @@ def extract_rolling(text: str) -> list[dict]:
 
 
 def _reading_digits(text: str) -> str:
-    """The register digits the model wrote, leading zeros kept, register code
-    removed, no decimal point; "" when there is no usable reading."""
+   
     answers = re.findall(r"READING:[ \t]*\**[ \t]*([^\n*]+)", text, re.IGNORECASE)
     if answers:
         reading = ""
@@ -344,8 +280,7 @@ def _reading_digits(text: str) -> str:
                 return ""
             reading += re.sub(r"[.,]", "", token)
         codes = re.findall(r"CODE:[ \t]*\**[ \t]*([^\n*]*)", text, re.IGNORECASE)
-        # A wheel counter has no LCD register code. Its first wheels must not
-        # disappear merely because their values resemble a glued register code.
+        
         if extract_device_type(text) != 'mechanical':
             reading = _strip_code(reading, codes[-1] if codes else "")
     else:
@@ -361,13 +296,30 @@ def _reading_digits(text: str) -> str:
     if extract_device_type(text) == 'mechanical':
         cells = re.findall(r'^CELLS:[ \t]*([^\n]*)', text, re.IGNORECASE | re.MULTILINE)
         if cells and re.fullmatch(r'[ \t]*\d(?:[ \t]+\d)*[ \t]*', cells[-1]):
-            # Refuse a shortened or changed concatenation; the reread path can
-            # try again rather than reporting a confident missing-wheel value.
             if ''.join(cells[-1].split()) != reading:
                 return ""
     if _digit_count(reading) > _MAX_READING_DIGITS:
         return ""
     return reading
+ 
+def extract_decimal_digits(text: str) -> int | None:
+    if extract_device_type(text) != 'mechanical':
+        return None
+    answers = re.findall(r'^DECIMALS:[ \t]*(\d+|UNKNOWN)[ \t]*$', text, re.IGNORECASE | re.MULTILINE)
+    windows = extract_window_decimals(text)
+    if windows is not None:
+        count = windows
+    elif not answers or answers[-1].upper() == 'UNKNOWN':
+        count = None
+    else:
+        count = int(answers[-1])
+    digits = _reading_digits(text)
+    return count if count is not None and digits and 0 <= count < len(digits) else None
+
+def extract_reading(text: str) -> str:
+    reading = _reading_digits(text)
+    stripped = reading.lstrip("0")
+    return stripped or (reading and "0")
 
 
 @dataclass
@@ -386,13 +338,8 @@ class OcrResult:
     sent_png: bytes | None = None            # the enhanced photo the model read; None: it read the original
 
 
-# A photo whose score S is below this is flagged for a retake, with the reasons.
 RETAKE_SCORE = float(os.environ.get('FOTOMATES_RETAKE_SCORE', '0.5'))
-# A photo whose score S is below this gets a note on its quality and speed.
 QUALITY_SCORE = float(os.environ.get('FOTOMATES_QUALITY_SCORE', '0.9'))
-# ... or whose least certain digit is below this. On 224 checked reads, 2 of the
-# 40 whose every digit was at least 95% sure were wrong, against 7 of the 58
-# with a score of at least 0.9: one doubtful digit hides in a high score.
 QUALITY_DIGIT = float(os.environ.get('FOTOMATES_QUALITY_DIGIT', '0.95'))
 
 
@@ -406,9 +353,8 @@ def _digit_reason(parts: dict) -> list[str]:
         which = f"the {position}{suffix} digit" + (f" ({value})" if value is not None else '')
     else:
         which = 'a leading zero'
-    if rival is not None:
-        return [f"{which} is only {parts['weakest']:.2f} ahead of a {rival}: check it on the meter"]
-    return [f"{which} is only {100 * parts['weakest']:.0f}% sure: check it on the meter"]
+    could_be = f" (it could be a {rival})" if rival is not None else ''
+    return [f"{which} is only {100 * parts['weakest']:.0f}% sure{could_be}: check it on the meter"]
 
 
 def low_score_reasons(parts: dict) -> list[str]:
@@ -425,51 +371,55 @@ def score_reading(cells: str, per_digit: list | None, decimals: int | None,
                   margins: list | None = None, runner_ups: list | None = None,
                   alternatives: list | None = None, mechanical: bool = False) -> dict:
 
+    """The probability that every digit of the consumption is right: the product of each
+    digit's probability. An alternative that leaves the consumption unchanged counts
+    for the digit written: a 0 at its first digit (only one leading zero more) and, on
+    the last whole wheel of a counter, a neighbouring number it is turning between.
+    The model's digit probabilities already carry what the photo lets it see: blur,
+    glare or a dim display make the digits it reads uncertain."""
     cells, per_digit = cells or '', per_digit or []
     lead = len(cells) - len(cells.lstrip('0'))
     end = len(cells) - (decimals or 0)
     consumption = cells[lead:end] if lead < end else (cells and '0')
     aligned = len(per_digit) == len(cells)
-    scored = []  # (margin, index, rival)
+    # The consumption's digits only; a consumption of 0 is its last whole cell.
+    digits_counted = range(lead, end) if lead < end else range(max(end - 1, 0), max(end, 0))
+    scored = []  # (probability right, index, most likely wrong digit)
     if aligned and alternatives and len(alternatives) == len(cells):
-        # The consumption's digits only; a consumption of 0 is its last whole cell.
-        digits_counted = range(lead, end) if lead < end else range(max(end - 1, 0), max(end, 0))
         for index in digits_counted:
             written = cells[index]
-            # At the first digit of the consumption a 0 changes nothing: it is a leading zero more.
             turning = mechanical and index == end - 1  # the last whole wheel of a counter
-            changes = {digit: p for digit, p in (alternatives[index] or {}).items()
-                       if digit != written and not (index == lead and digit == '0')
-                       and not (turning and (int(digit) - int(written)) % 10 in (1, 9))}
+            options = alternatives[index] or {}
+            same = {digit for digit in options if digit != written and (
+                (index == lead and digit == '0') or (turning and (int(digit) - int(written)) % 10 in (1, 9)))}
+            changes = {digit: p for digit, p in options.items() if digit != written and digit not in same}
             rival = max(changes, key=changes.get, default=None)
-            scored.append((per_digit[index] - (changes[rival] if rival else 0.0), index, rival))
+            scored.append((min(1.0, per_digit[index] + sum(options[digit] for digit in same)), index, rival))
     elif aligned:
-        values = margins if margins and len(margins) == len(per_digit) else per_digit
         rivals = runner_ups if runner_ups and len(runner_ups) == len(per_digit) else [None] * len(per_digit)
-        for index in (range(lead, end) if lead < end else range(len(cells))):
-            if index == lead and rivals[index] == '0':  # only a leading zero more: its probability alone
-                scored.append((per_digit[index], index, None))
+        seconds = ([p - m for p, m in zip(per_digit, margins)] if margins and len(margins) == len(per_digit)
+                   else [0.0] * len(per_digit))
+        for index in digits_counted:
+            if index == lead and rivals[index] == '0':  # only a leading zero more: it counts as right
+                scored.append((min(1.0, per_digit[index] + seconds[index]), index, None))
             else:
-                scored.append((values[index], index, rivals[index]))
+                scored.append((per_digit[index], index, rivals[index]))
     weakest = position = digit = rival = None
+    total = None
     if scored:
         weakest, index, rival = min(scored)
         # Counted in the reading as shown, without its leading zeros; 0 for a leading zero.
         position, digit = (index + 1 - lead if index >= lead else 0), cells[index]
+        total = math.prod(p for p, _, _ in scored)
     elif per_digit:
-        weakest = min(per_digit)
-    total = 0.0 if not consumption else weakest
+        weakest = total = min(per_digit)
+    total = 0.0 if not consumption else total
     return dict(total=None if total is None else round(max(total, 0.0), 3),
                 weakest=None if weakest is None else round(max(weakest, 0.0), 3),
                 weakest_position=position, weakest_digit=digit, weakest_runner_up=rival)
 
 
 def _digit_confidence(choice) -> tuple[float | None, list, list, list, list]:
-    """Per digit of the READING line: the probability of the digit written, its
-    margin over the most likely other digit (the runner-up among the model's top
-    alternatives), and that runner-up digit. A 5 at 78% with 9 at 22% has a
-    margin of 0.56: the model was torn between the two. Returns (weakest
-    probability, probabilities, margins, runner-ups and alternatives)."""
     tokens = getattr(getattr(choice, 'logprobs', None), 'content', None) or []
     joined = ''.join(token.token or '' for token in tokens)
     marker = joined.upper().rfind('READING:')
@@ -509,8 +459,6 @@ class OcrFailure(Exception):
 
 
 def _failure_reason(error: Exception) -> str:
-    # APIConnectionError wraps the useful HTTPX/socket error in __cause__.
-    # Keep this in console/CSV evidence even when nothing reaches Docker logs.
     chain, seen = [], set()
     current = error
     while current is not None and id(current) not in seen and len(chain) < 5:
@@ -637,11 +585,7 @@ _USER_PROMPT = (
     "ROLLING: position:lower-upper for each turning wheel, comma separated, or NONE\n"
     "DECIMALS: visually marked fractional wheel count, 0 when none, or UNKNOWN.")
 
-# The same rules restructured (role and output contract in the system prompt;
-# task, what to read, what to ignore, digit shapes, decimals, rolling wheels and
-# when unsure in the user prompt), each said once: about half the tokens, and
-# TYPE first so the lines after it follow from it. The default;
-# FOTOMATES_PROMPT=full goes back to the prompt above.
+
 _COMPACT_SYSTEM_PROMPT = (
     "You read electricity meter registers from photos. Answer with exactly these six "
     "lines and nothing else:\n"
@@ -651,7 +595,7 @@ _COMPACT_SYSTEM_PROMPT = (
     "orange, yellow, other), with -small when its digit is smaller than the other "
     "wheels' digits; DIGITAL: NONE\n"
     "READING: every digit of the main row as one string with no dot or comma, or "
-    "UNREADABLE, or NO METER\n"
+    "UNREADABLE, or NO METER, or BLANK\n"
     "ROLLING: MECHANICAL wheels caught between two numbers as position:lower-upper, "
     "comma separated; otherwise NONE\n"
     "DECIMALS: MECHANICAL: number of wheels at the right end with a smaller digit or "
@@ -678,12 +622,34 @@ _COMPACT_USER_PROMPT = (
     "when larger, darker or closer to the camera than the wheels.\n"
     "\n"
     "DIGIT SHAPES (read each digit from its own strokes, not from what you expect)\n"
-    "- 7 has no lower-left stroke and no bottom; 9 has a top-left stroke and a bottom. 8 "
-    "has the middle bar that 0 lacks. 1 is a single stroke on the right.\n"
-    "- 5 or 9: a 9 closes its top into a loop at the upper right; a 5 has a flat top bar "
-    "and a stroke down the left only, open at the upper right. Write 9 only when that "
-    "upper loop is closed.\n"
-    "- 5 or 6: a 6 closes its lower half on the left; a 5 is open at the lower left.\n"
+    "- Each digit is made of up to 7 strokes: top, upper-left, upper-right, middle, "
+    "lower-left, lower-right, bottom. Printed wheel digits follow the same layout, curved. "
+    "On an LCD, faint unlit segments do not count.\n"
+    "  0: all but middle | 1: upper-right, lower-right only | 2: top, upper-right, middle, "
+    "lower-left, bottom | 3: top, upper-right, middle, lower-right, bottom | 4: upper-left, "
+    "upper-right, middle, lower-right | 5: top, upper-left, middle, lower-right, bottom | "
+    "6: top, upper-left, middle, lower-left, lower-right, bottom | 7: top, upper-right, "
+    "lower-right (some displays add upper-left) | 8: all seven | 9: all but lower-left\n"
+    "- Compare each digit with the other digits of the same row: they share one font, so "
+    "a stroke that is lit or printed in one digit looks the same in the next.\n"
+    "- The most frequent mistakes are 7 read as 1 and 6 read as 5. Avoid them:\n"
+    "  1 or 7: a top bar across the top of the cell makes it 7, however short or faint. "
+    "A 1 has no top bar at all. Write 1 only when the top of the cell is empty.\n"
+    "  5 or 6: a stroke on the lower left, closing the lower loop, makes it 6. Write 5 "
+    "only when the lower left is clearly empty.\n"
+    "- 8 or 6: 8 closes its upper loop on the right; 6 is open at the upper right. "
+    "8 or 9: 9 is open at the lower left. 8 or 0: 0 has no middle stroke. 8 or 3: 3 has "
+    "no left strokes.\n"
+    "- 3 or 5: 3 has the upper-right stroke and no upper-left; 5 has the upper-left and "
+    "no upper-right. 3 or 9: 9 has the upper-left stroke; 3 does not.\n"
+    "- 2 or 5: mirror images. 2 goes down the upper right and the lower left; 5 goes down "
+    "the upper left and the lower right. 2 or 7: 2 has a middle stroke and a bottom bar. "
+    "2 or 4: 4 has an upper-left stroke and no top or bottom bar. 1 or 4: 4 has an "
+    "upper-left stroke and a middle bar.\n"
+    "- A faint but present stroke still counts; glare or a reflection never adds one.\n"
+    "- Before replying, look again at every 1, 5, 3 and 6 you wrote: is there a top bar "
+    "(then 7), a lower-left stroke (then 6), an upper-right stroke that closes the top "
+    "(then 9 or 8)?\n"
     "\n"
     "DECIMALS (MECHANICAL)\n"
     "- Write WINDOWS first. A wheel at the right end is a decimal ONLY when its digit is "
@@ -692,22 +658,32 @@ _COMPACT_USER_PROMPT = (
     "glare can make red look pale). Nothing else makes a decimal: not a frame of the same "
     "colour, not a dot or comma, not a printed 0.1 label, not being the last wheel. "
     "Otherwise DECIMALS: 0. Keep decimal wheels in READING.\n"
-    "- Examples: black wheels 0 4 7 2 9 3 then a 6 in a red box: WINDOWS: dark dark dark "
-    "dark dark dark red, READING: 0472936, DECIMALS: 1. A dark band 0 4 2 9 6 then a 7 "
-    "in a white box: WINDOWS: dark dark dark dark dark white, READING: 042967, DECIMALS: "
-    "1. Wheels 1 2 3 4 5 then a smaller 6, same colour: WINDOWS: dark dark dark dark dark "
-    "dark-small, READING: 123456, DECIMALS: 1. Black wheels 3 8 1 2 5 6, all the same "
-    "size and colour: READING: 381256, DECIMALS: 0.\n"
+    "- Examples (window patterns only, never copy digits from them): six black wheels "
+    "then one wheel in a red box: WINDOWS: dark dark dark dark dark dark red, DECIMALS: 1. "
+    "Five wheels on a dark band then one in a white box: WINDOWS: dark dark dark dark "
+    "dark white, DECIMALS: 1. Five wheels then a smaller digit, same colour: WINDOWS: "
+    "dark dark dark dark dark dark-small, DECIMALS: 1. Six wheels all the same size and "
+    "colour: DECIMALS: 0.\n"
     "\n"
     "ROLLING (MECHANICAL)\n"
     "- A wheel showing parts of two numbers: write the lower in READING (9 when it turns "
     "from 9 to 0) and list it as its position in READING from the left, then the two "
     "numbers, e.g. 6:6-7.\n"
     "\n"
+    "NO METER OR BLANK PHOTO\n"
+    "- BLANK: the photo shows nothing recognisable: all or nearly all black, white, grey "
+    "or one colour, the lens covered, or so blurred that no object can be made out.\n"
+    "- NO METER: the photo shows something, but no meter register: no meter LCD or LED "
+    "display and no counter window of number wheels. Numbers alone are not a meter: "
+    "numbers on a sticker, label, paper, document, nameplate, serial plate, barcode, "
+    "phone screen, wall, door, box or cable are NO METER, even when they look like a "
+    "reading. Never write digits that are not on a meter's register.\n"
+    "- A meter is visible but its display is off, dark or cannot be read: UNREADABLE, "
+    "not NO METER and not BLANK.\n"
+    "\n"
     "WHEN UNSURE\n"
-    "- Too blurred, dim or washed out to read every cell: UNREADABLE. No meter in the "
-    "photo: NO METER. Never guess a digit and never shorten the reading to fit a length "
-    "you expect.")
+    "- Too blurred, dim or washed out to read every cell: UNREADABLE. Never guess a digit "
+    "and never shorten the reading to fit a length you expect.")
 if os.environ.get('FOTOMATES_PROMPT', 'compact') == 'compact':
     _SYSTEM_PROMPT, _USER_PROMPT = _COMPACT_SYSTEM_PROMPT, _COMPACT_USER_PROMPT
 
@@ -773,14 +749,15 @@ def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: flo
 
 def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds: list,
                 backend_choice: Backend = DEFAULT_BACKEND, scale: float = 1.0):
-    # The photo is only decoded to judge it: whether it needs enhancing.
+    # The photo is decoded to judge it: whether it is too small or needs enhancing.
     report = dict(blur_variance=0.0)
     needs = []
-    enlarged = scale != 1.0
+    original = timed('decode image', lambda: decode_image(image_path))
+    # A small photo is enlarged until its shorter side reaches _MIN_SIDE: on a
+    # 240x400 photo a digit is ~10 px, smaller than one image patch of the model.
+    scale = max(scale, _MIN_SIDE / min(original.shape[:2]))
+    enlarged = scale > 1.0
     if _ENHANCE_MODE != 'never' or enlarged:
-        # Read at its own size, unless a second read asks for it enlarged
-        # (scale): a small photo's digits are a few pixels wide there.
-        original = timed('decode image', lambda: decode_image(image_path))
         if enlarged:
             original = timed('enlarge photo', lambda: cv2.resize(original, None, fx=scale, fy=scale,
                                                                  interpolation=cv2.INTER_CUBIC))
@@ -807,8 +784,6 @@ def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds
         {"type": "image_url", "image_url": {"url": encoded}},
     ]
 
-    # Straight to the model server, no slot claimed or waited for: the server
-    # queues what it cannot run yet. A model on several servers takes them in turn.
     servers = backend_choice.servers
     model_server = servers[next(_TURN) % len(servers)]
     if len(servers) > 1:

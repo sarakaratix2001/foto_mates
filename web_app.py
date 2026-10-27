@@ -28,7 +28,7 @@ from audit_readings import (AUDIT_DB, LIST_KINDS, connect as audit_connect, list
                             split_decimals, summary as audit_summary)
 from evaluation import LABELS as EVALUATION_LABELS, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, OCR_MODEL, PHOTO_TYPES, QUALITY_DIGIT, QUALITY_SCORE,
-                              RETAKE_SCORE, _reading_digits, backend as model_backend, extract_no_meter, score_reading,
+                              RETAKE_SCORE, _reading_digits, backend as model_backend, extract_blank, extract_no_meter, score_reading,
                               WORKERS_PER_SLOT, low_score_reasons, ocr_image, quality_reasons,
                               server_slots, warm_up)
 
@@ -83,8 +83,14 @@ def quality_note(score, parts, seconds=None):
     return note
 
 
-def verdict(reading, score=None, parts=None, seconds=None):
+def verdict(reading, score=None, parts=None, seconds=None, text=None):
    
+    if not reading and extract_blank(text):
+        return dict(status='blank', retake=True, quality_note=None,
+                    retake_reason='the photo is blank: nothing recognisable in it')
+    if not reading and extract_no_meter(text):
+        return dict(status='no_meter', retake=True, quality_note=None,
+                    retake_reason='no meter found in the photo')
     if not reading:
         return dict(status='no_digits', retake=True, quality_note=None,
                     retake_reason='no reading could be taken from the photo')
@@ -114,13 +120,13 @@ def consumption(filename, cells, per_digit=None, margins=None, runner_ups=None, 
 
 def with_verdicts(job):
     for item in job['images']:
-        if item.get('status') in ('done', 'no_digits'):
+        if item.get('status') in ('done', 'no_digits', 'no_meter', 'blank'):
             item.update(consumption(item.get('filename'), item.get('all_digits') or item.get('reading'),
                                     item.get('digit_confidence'), item.get('digit_margin'),
                                     item.get('digit_runner_up'), item.get('digit_alternatives'),
                                     item.get('device_type'), item.get('decimal_digits')))
             item.update(verdict(item.get('reading'), item.get('score'), item.get('score_parts'),
-                                item.get('seconds')))
+                                item.get('seconds'), item.get('raw_text')))
     job['evaluation'] = batch_evaluation(job)
     job['evaluation_lines'] = evaluation_lines(job['evaluation'])
     return job
@@ -129,8 +135,8 @@ def with_verdicts(job):
 def batch_evaluation(job):
     return evaluate(dict(name=item.get('filename'), saved=item.get('stored_reading'), extracted=item.get('reading'),
                          all_digits=item.get('all_digits'), score=item.get('score'), status=item.get('status'),
-                         no_meter=extract_no_meter(item.get('raw_text')))
-                    for item in job['images'] if item.get('status') in ('done', 'no_digits', 'error'))
+                         no_meter=extract_no_meter(item.get('raw_text')), blank=extract_blank(item.get('raw_text')))
+                    for item in job['images'] if item.get('status') in ('done', 'no_digits', 'no_meter', 'blank', 'error'))
 
 
 def process_image(job, item):
@@ -161,7 +167,7 @@ def process_image(job, item):
                     digit_margin=result.digit_margin, digit_runner_up=result.digit_runner_up,
                     digit_alternatives=result.digit_alternatives,
                     rolling=result.rolling, device_type=result.device_type, decimal_digits=result.decimal_digits,
-                    **verdict(reading, read['score'], read['score_parts']))
+                    **verdict(reading, read['score'], read['score_parts'], text=result.text))
     except Exception as exc:
         item.update(status='error', error=str(exc),
                     raw_text=getattr(exc, 'breakdown', '').lstrip('\n'))
@@ -169,7 +175,8 @@ def process_image(job, item):
     # reading, so it shows how long it took to fail.
     item['seconds'] = round(time.monotonic() - started if reading_seconds is None else reading_seconds, 1)
     if item['status'] != 'error':
-        item.update(verdict(item.get('reading'), item.get('score'), item.get('score_parts'), item['seconds']))
+        item.update(verdict(item.get('reading'), item.get('score'), item.get('score_parts'), item['seconds'],
+                            item.get('raw_text')))
     print(f"{item['filename']}: {item.get('all_digits') or '-'} -> {item.get('reading') or '-'} "
           f"({item['seconds']}s)", flush=True)
     if item.get('quality_note'):
@@ -178,11 +185,7 @@ def process_image(job, item):
 
 
 def image_workers(choice):
-    """Photos read at once with one model choice. A server that reports its
-    slots (llama.cpp) gets WORKERS_PER_SLOT per slot, at most IMAGE_WORKERS: the
-    extra worker prepares the next photo while the slot is busy. A server that
-    does not (vLLM) batches whatever it is sent, so it gets the choice's own
-    worker count, up to 1000 photos in flight."""
+ 
     slots = server_slots(choice.servers)
     if choice.fixed_workers or not slots:
         workers = choice.workers

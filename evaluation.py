@@ -9,19 +9,22 @@ GROUPS = [
     ('matched', 'Matched the saved reading'),
     ('mismatch_high', f'Mismatched, evaluation score {SCORE_THRESHOLD} or higher'),
     ('mismatch_low', f'Mismatched, evaluation score below {SCORE_THRESHOLD}'),
-    ('no_meter', 'No meter in the picture'),
-    ('no_digits', 'No digits found (meter, but nothing readable)'),
+    ('no_meter', 'Anomaly: model did not identify a meter'),
+    ('blank', 'Blank photo: nothing recognisable in it'),
+    ('no_digits', 'No digits could be extracted (e.g. black or unreadable display)'),
     ('no_saved', 'No saved reading in the file name to compare with'),
-    ('failed', 'Failed (model error)'),
+    ('failed', 'Technical processing failure'),
 ]
 LABELS = dict(GROUPS)
 
 
 def group(row) -> str:
     """The group of one photo: a dict with saved, extracted, score, status
-    ('done', 'missing' / 'no_digits', 'error') and no_meter (bool)."""
+    ('done', 'missing' / 'no_digits', 'error'), no_meter and blank (bool)."""
     if row.get('status') == 'error':
         return 'failed'
+    if row.get('blank'):
+        return 'blank'
     if row.get('no_meter'):
         return 'no_meter'
     if row.get('extracted') in (None, ''):
@@ -49,4 +52,4 @@ def lines(evaluation: dict) -> list[tuple[str, str, str]]:
     """(group key, label, count) for every group, the last two only when not empty."""
     counts = evaluation['counts']
     return [(key, label, str(counts[key])) for key, label in GROUPS
-            if counts[key] or key not in ('no_saved', 'failed')]
+            if counts[key] or key not in ('no_saved', 'failed', 'blank')]
