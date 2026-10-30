@@ -215,9 +215,17 @@ def _digit_count(reading: str) -> int:
 
 _DOTTED_CODE = re.compile(r"^(?:\d{1,2}[.,]){2,}\d{1,2}(?=[.,]|$)[.,]?")
 _GLUED_CODE = re.compile(r"^(?:1\d|[1-9])[5-8]\d(?=0\d{5})")
+# Register codes a display shows before its reading (3.8.0, 5.8.0, 15.8.0, ...): an
+# 11-digit reading that starts with one has the code glued on, as no meter shows 11
+# digits of its own. 1588 and 1589 are 15.8.0 with its last 0 misread.
+_ELEVEN_DIGIT_CODES = ('1588', '1580', '1589', '380', '580', '680', '390', '300')
 
 
 def _strip_code(digits: str, code: str) -> str:
+    if len(digits) == 11:
+        known = next((c for c in _ELEVEN_DIGIT_CODES if digits.startswith(c)), None)
+        if known:
+            return digits[len(known):]
     code_digits = re.sub(r"\D", "", code)
     if len(code_digits) >= 2 and digits.startswith(code_digits) \
             and len(digits) - len(code_digits) >= 4:
@@ -334,17 +342,41 @@ class OcrResult:
     rolling: list | None = None              # mechanical wheels caught between two numbers
     device_type: str | None = None           # 'mechanical', 'digital', or None when not said
     decimal_digits: int | None = None        # visually marked fractional wheels; 0 means none
+    clear: float | None = None               # the model's probability that the photo is CLEAR, 0..1
+    code_confidence: list | None = None      # per digit of a register code cut from the front of READING
     reading_seconds: float | None = None     # the model reading the photo plus digit extraction
     sent_png: bytes | None = None            # the enhanced photo the model read; None: it read the original
 
 
 RETAKE_SCORE = float(os.environ.get('FOTOMATES_RETAKE_SCORE', '0.5'))
+# A reading with this many digits or more gets score 0: no meter shows 12 digits.
+TOO_MANY_DIGITS = int(os.environ.get('FOTOMATES_TOO_MANY_DIGITS', '12'))
+# QUALITY: CLEAR/POOR is only recorded (its chance of CLEAR is saved with each photo);
+# it never rejects a photo unless this is set above 0: retake below this chance of CLEAR.
+RETAKE_CLEAR = float(os.environ.get('FOTOMATES_RETAKE_CLEAR', '0'))
+
+
+def test_pattern(cells: str) -> bool:
+    """A digital display's segment test: every cell the same, 0 or 8 (00000000, 88888888)."""
+    return len(cells) >= 4 and len(set(cells)) == 1 and cells[0] in '08'
+
+
+def photo_retake_reason(cells: str, clear: float | None) -> str | None:
+    """Why the photo itself, whatever its digits' confidence, must be retaken; None when it need not."""
+    if test_pattern(cells):
+        return 'the display shows its test pattern, not the reading'
+    if clear is not None and clear < RETAKE_CLEAR:
+        return f'the photo is not clear enough to check the digits ({100 * clear:.0f}% clear)'
+    return None
 QUALITY_SCORE = float(os.environ.get('FOTOMATES_QUALITY_SCORE', '0.9'))
 QUALITY_DIGIT = float(os.environ.get('FOTOMATES_QUALITY_DIGIT', '0.95'))
 
 
 def _digit_reason(parts: dict) -> list[str]:
     """The least certain digit, how sure the model was of it and what it could also be."""
+    if parts and parts.get('too_long'):
+        return [f"{parts['digit_count']} digits were read, and no meter shows that many: part of the "
+                "display that is not the reading (a register code or a second line) was read with it"]
     if not parts or parts.get('weakest') is None:
         return ['no digit probabilities from the model']
     position, value, rival = parts['weakest_position'], parts.get('weakest_digit'), parts.get('weakest_runner_up')
@@ -371,39 +403,34 @@ def score_reading(cells: str, per_digit: list | None, decimals: int | None,
                   margins: list | None = None, runner_ups: list | None = None,
                   alternatives: list | None = None, mechanical: bool = False) -> dict:
 
-    """The probability that every digit of the consumption is right: the product of each
-    digit's probability. An alternative that leaves the consumption unchanged counts
-    for the digit written: a 0 at its first digit (only one leading zero more) and, on
-    the last whole wheel of a counter, a neighbouring number it is turning between.
-    The model's digit probabilities already carry what the photo lets it see: blur,
-    glare or a dim display make the digits it reads uncertain."""
+    """The probability that every digit read from the photo is right: the product of
+    each digit's probability, leading zeros and decimals included. It is made from the
+    photo alone: the saved reading in the file name plays no part, so it can be
+    compared with the reading afterwards. decimals is what the model saw on the meter
+    (None when it did not say), never a count derived from the saved reading. The one
+    alternative that counts for the digit written is, on the last whole wheel of a
+    counter, a neighbouring number it is turning between. The model's digit
+    probabilities already carry what the photo lets it see: blur, glare or a dim
+    display make the digits it reads uncertain."""
     cells, per_digit = cells or '', per_digit or []
-    lead = len(cells) - len(cells.lstrip('0'))
+    lead = len(cells) - len(cells.lstrip('0'))  # only to name a weak digit in messages
     end = len(cells) - (decimals or 0)
-    consumption = cells[lead:end] if lead < end else (cells and '0')
     aligned = len(per_digit) == len(cells)
-    # The consumption's digits only; a consumption of 0 is its last whole cell.
-    digits_counted = range(lead, end) if lead < end else range(max(end - 1, 0), max(end, 0))
     scored = []  # (probability right, index, most likely wrong digit)
     if aligned and alternatives and len(alternatives) == len(cells):
-        for index in digits_counted:
-            written = cells[index]
-            turning = mechanical and index == end - 1  # the last whole wheel of a counter
+        for index, written in enumerate(cells):
+            # The last whole wheel of a counter, known only when the model saw its decimals.
+            turning = mechanical and decimals is not None and index == end - 1
             options = alternatives[index] or {}
-            same = {digit for digit in options if digit != written and (
-                (index == lead and digit == '0') or (turning and (int(digit) - int(written)) % 10 in (1, 9)))}
+            same = {digit for digit in options if digit != written and turning
+                    and (int(digit) - int(written)) % 10 in (1, 9)}
             changes = {digit: p for digit, p in options.items() if digit != written and digit not in same}
             rival = max(changes, key=changes.get, default=None)
             scored.append((min(1.0, per_digit[index] + sum(options[digit] for digit in same)), index, rival))
     elif aligned:
         rivals = runner_ups if runner_ups and len(runner_ups) == len(per_digit) else [None] * len(per_digit)
-        seconds = ([p - m for p, m in zip(per_digit, margins)] if margins and len(margins) == len(per_digit)
-                   else [0.0] * len(per_digit))
-        for index in digits_counted:
-            if index == lead and rivals[index] == '0':  # only a leading zero more: it counts as right
-                scored.append((min(1.0, per_digit[index] + seconds[index]), index, None))
-            else:
-                scored.append((per_digit[index], index, rivals[index]))
+        for index in range(len(cells)):
+            scored.append((per_digit[index], index, rivals[index]))
     weakest = position = digit = rival = None
     total = None
     if scored:
@@ -413,41 +440,90 @@ def score_reading(cells: str, per_digit: list | None, decimals: int | None,
         total = math.prod(p for p, _, _ in scored)
     elif per_digit:
         weakest = total = min(per_digit)
-    total = 0.0 if not consumption else total
+    total = 0.0 if not cells else total
+    # No meter shows 12 digits: such a reading includes something that is not the reading.
+    too_long = len(cells) >= TOO_MANY_DIGITS
+    if too_long:
+        total = 0.0
     return dict(total=None if total is None else round(max(total, 0.0), 3),
                 weakest=None if weakest is None else round(max(weakest, 0.0), 3),
-                weakest_position=position, weakest_digit=digit, weakest_runner_up=rival)
+                weakest_position=position, weakest_digit=digit, weakest_runner_up=rival,
+                too_long=too_long, digit_count=len(cells))
 
 
 def _digit_confidence(choice) -> tuple[float | None, list, list, list, list]:
+    """Each digit's probability where the model first read it off the photo: the
+    CELLS line. READING repeats those digits, so there the model is copying and is
+    always near 100% sure. A display with no cells (CELLS: NONE) is first read at
+    READING, and so is any answer whose CELLS do not give the READING's digits."""
+    tokens = getattr(getattr(choice, 'logprobs', None), 'content', None) or []
+    reading = _line_digits(tokens, 'READING:')
+    cells = _line_digits(tokens, 'CELLS:')
+    probabilities, margins, runner_ups, alternatives = (
+        cells if cells[0] and len(cells[0]) == len(reading[0]) else reading)
+    return (min(probabilities) if probabilities else None), probabilities, margins, runner_ups, alternatives
+
+
+def _clear_probability(choice) -> float | None:
+    """The probability the model gave QUALITY: CLEAR, from the first word it wrote
+    on that line and its alternatives; None when it wrote no QUALITY line."""
     tokens = getattr(getattr(choice, 'logprobs', None), 'content', None) or []
     joined = ''.join(token.token or '' for token in tokens)
-    marker = joined.upper().rfind('READING:')
+    marker = joined.upper().rfind('QUALITY:')
     if marker < 0:
-        return None, [], [], [], []
-    begin, offset = marker + len('READING:'), 0
+        return None
+    begin, offset = marker + len('QUALITY:'), 0
+    for token in tokens:
+        piece = token.token or ''
+        end = offset + len(piece)
+        word = piece[max(0, begin - offset):].strip().upper()
+        if end > begin and word and token.logprob is not None:
+            options = {word: math.exp(token.logprob)}
+            for alt in getattr(token, 'top_logprobs', None) or []:
+                key = alt.token.strip().upper()
+                if alt.logprob is not None and key:
+                    options[key] = max(options.get(key, 0.0), math.exp(alt.logprob))
+            clear = sum(p for key, p in options.items() if key[:1] == 'C')
+            poor = sum(p for key, p in options.items() if key[:1] == 'P')
+            return clear / (clear + poor) if clear + poor else None
+        offset = end
+    return None
+
+
+def _line_digits(tokens, label: str) -> tuple[list, list, list, list]:
+    """The probability, margin, runner-up and alternatives of each digit written
+    after label, up to the end of the number or of its line."""
+    joined = ''.join(token.token or '' for token in tokens)
+    marker = joined.upper().rfind(label)
+    if marker < 0:
+        return [], [], [], []
+    begin, offset = marker + len(label), 0
     probabilities, margins, runner_ups, alternatives = [], [], [], []
     for token in tokens:
         piece, logprob = token.token or '', token.logprob
         end = offset + len(piece)
         if end > begin and logprob is not None:
-            digits = sum(ch.isdigit() for ch in piece)
+            part = piece[max(0, begin - offset):]  # the token's text after label
+            written = part.split('\n')[0]  # and on its line
+            digits = sum(ch.isdigit() for ch in written)
             if digits:
                 probability = math.exp(logprob)
                 options = {}
                 for alt in getattr(token, 'top_logprobs', None) or []:
                     if alt.logprob is not None and alt.token.strip().isdigit() and len(alt.token.strip()) == 1:
                         options[alt.token.strip()] = max(options.get(alt.token.strip(), 0.0), math.exp(alt.logprob))
-                others = [(p, d) for d, p in options.items() if d != piece.strip()]
+                others = [(p, d) for d, p in options.items() if d != written.strip()]
                 second, rival = max(others, default=(0.0, None))
                 probabilities.extend([probability] * digits)
                 margins.extend([max(0.0, probability - second)] * digits)
                 runner_ups.extend([rival] * digits)
                 alternatives.extend([options] * digits)
-            elif probabilities and piece.strip() and piece.strip() not in '.,':
+            elif probabilities and written.strip() and written.strip() not in '.,':
                 break  # the number is over
+            if '\n' in part:
+                break  # the line is over
         offset = end
-    return (min(probabilities) if probabilities else None), probabilities, margins, runner_ups, alternatives
+    return probabilities, margins, runner_ups, alternatives
 
 
 class OcrFailure(Exception):
@@ -482,17 +558,18 @@ _SYSTEM_PROMPT = (
     "the counter window; never read handwritten, painted, or sticker numbers. "
     "For a mechanical counter, first transcribe each physical wheel separately, "
     "then concatenate those same digits into READING without losing the final wheel. "
-    "Reply with exactly these six "
+    "Reply with exactly these seven "
     "lines and nothing else, no explanation:\n"
     "CELLS: <MECHANICAL: each wheel digit from left to right separated by spaces; DIGITAL: NONE>\n"
     "WINDOWS: <MECHANICAL: each wheel's window colour from left to right, with -box when "
     "it has its own frame; DIGITAL: NONE>\n"
-    "READING: <every digit cell of the main row of large digits, UNREADABLE, or NO METER>\n"
+    "READING: <every digit cell of the main row of large digits, UNREADABLE, NO METER, or BLANK>\n"
     "TYPE: <DIGITAL for an LCD or LED display, MECHANICAL for a counter of turning number wheels>\n"
     "ROLLING: <only for MECHANICAL: wheels caught turning between two numbers, as "
     "position:lower-upper; NONE for DIGITAL or when no wheel is turning>\n"
     "DECIMALS: <MECHANICAL: visually marked fractional wheel count, 0 if none; "
-    "UNKNOWN for DIGITAL or if fractional markings cannot be determined>")
+    "UNKNOWN for DIGITAL or if fractional markings cannot be determined>\n"
+    "QUALITY: <CLEAR or POOR>")
 _USER_PROMPT = (
     "Read the consumption register on this meter: the main row of large digits on the display.\n"
     "First find that row: the longest line of the largest digits, side by side. Then read "
@@ -530,6 +607,14 @@ _USER_PROMPT = (
     "left.\n"
     "Give the digits as one unbroken string with no dot and no comma. When the row cannot "
     "be read, write UNREADABLE; when the photo shows no meter at all, write NO METER.\n"
+    "Write BLANK when the photo shows nothing recognisable: all or nearly all black, white, "
+    "grey or one colour, the lens covered, or so blurred that no object can be made out. "
+    "Write NO METER when the photo shows something, but no meter register: no meter LCD or "
+    "LED display and no counter window of number wheels. Numbers alone are not a meter: "
+    "numbers on a sticker, label, paper, document, nameplate, serial plate, barcode, phone "
+    "screen, wall, door, box or cable are NO METER, even when they look like a reading. "
+    "Never write digits that are not on a meter's register. When a meter is visible but its "
+    "display is off, dark or cannot be read, write UNREADABLE, not NO METER and not BLANK.\n"
     "TYPE says what shows the register: DIGITAL for an LCD or LED display of segment "
     "digits, MECHANICAL for a counter of printed number wheels behind a window.\n"
     "For a MECHANICAL counter, locate every wheel aperture from the left edge to the "
@@ -577,17 +662,25 @@ _USER_PROMPT = (
     "A partially visible bottom or top of the final wheel still belongs to that "
     "wheel. If a required wheel cannot be read, use UNREADABLE rather than "
     "returning a shorter reading.\n"
-    "Reply with exactly six lines:\n"
+    "Last, judge the photo for QUALITY: could a person check every digit you wrote from "
+    "this photo alone, without guessing? CLEAR when every digit of the row is sharp and "
+    "fully visible. POOR when any digit is blurred, faint, washed out, under glare or a "
+    "reflection, cut off, too small to make out its strokes, or seen through a scratched "
+    "or misted cover; when the photo is of a screen or of another photo; or when the "
+    "display shows a test pattern (all segments lit, or every cell the same) instead of "
+    "the reading. When in doubt: POOR.\n"
+    "Reply with exactly seven lines:\n"
     "CELLS: mechanical wheel digits separated by spaces, or NONE for DIGITAL\n"
     "WINDOWS: one window word per wheel, as described above, or NONE for DIGITAL\n"
-    "READING: every digit cell of the main row, UNREADABLE, or NO METER\n"
+    "READING: every digit cell of the main row, UNREADABLE, NO METER, or BLANK\n"
     "TYPE: DIGITAL or MECHANICAL\n"
     "ROLLING: position:lower-upper for each turning wheel, comma separated, or NONE\n"
-    "DECIMALS: visually marked fractional wheel count, 0 when none, or UNKNOWN.")
+    "DECIMALS: visually marked fractional wheel count, 0 when none, or UNKNOWN\n"
+    "QUALITY: CLEAR or POOR.")
 
 
 _COMPACT_SYSTEM_PROMPT = (
-    "You read electricity meter registers from photos. Answer with exactly these six "
+    "You read electricity meter registers from photos. Answer with exactly these seven "
     "lines and nothing else:\n"
     "TYPE: DIGITAL (LCD or LED segments) or MECHANICAL (printed number wheels)\n"
     "CELLS: MECHANICAL: one digit per wheel, left to right, space separated; DIGITAL: NONE\n"
@@ -599,7 +692,8 @@ _COMPACT_SYSTEM_PROMPT = (
     "ROLLING: MECHANICAL wheels caught between two numbers as position:lower-upper, "
     "comma separated; otherwise NONE\n"
     "DECIMALS: MECHANICAL: number of wheels at the right end with a smaller digit or "
-    "a box of another colour, 0 if none; DIGITAL: UNKNOWN")
+    "a box of another colour, 0 if none; DIGITAL: UNKNOWN\n"
+    "QUALITY: CLEAR or POOR")
 _COMPACT_USER_PROMPT = (
     "TASK\n"
     "Read the consumption register: the main row of the largest digits on the display.\n"
@@ -683,7 +777,16 @@ _COMPACT_USER_PROMPT = (
     "\n"
     "WHEN UNSURE\n"
     "- Too blurred, dim or washed out to read every cell: UNREADABLE. Never guess a digit "
-    "and never shorten the reading to fit a length you expect.")
+    "and never shorten the reading to fit a length you expect.\n"
+    "\n"
+    "QUALITY (always, last)\n"
+    "- After reading, judge the photo: could a person check every digit you wrote from "
+    "this photo alone, without guessing?\n"
+    "- CLEAR: every digit of the row is sharp and fully visible.\n"
+    "- POOR: any digit is blurred, faint, washed out, under glare or a reflection, cut off, "
+    "too small to make out its strokes, or seen through a scratched or misted cover; the "
+    "photo is of a screen or of another photo; or the display shows a test pattern (all "
+    "segments lit, or every cell the same) instead of the reading. When in doubt: POOR.")
 if os.environ.get('FOTOMATES_PROMPT', 'compact') == 'compact':
     _SYSTEM_PROMPT, _USER_PROMPT = _COMPACT_SYSTEM_PROMPT, _COMPACT_USER_PROMPT
 
@@ -731,6 +834,16 @@ def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: flo
         reason = _failure_reason(error)
         raise OcrFailure(reason, breakdown(*server, 'FAILED: ' + reason)) from error
     confidence, per_digit, margins, runner_ups, alternatives = _digit_confidence(choice)
+    # A register code glued to the front of READING (380..., 158...) is cut from the
+    # digits by _reading_digits; cut its probabilities too, so each stays with its digit.
+    code_confidence = []
+    kept = len(_reading_digits(content) or '')
+    if kept and len(per_digit) > kept:
+        cut = len(per_digit) - kept
+        code_confidence = per_digit[:cut]
+        per_digit, margins, runner_ups, alternatives = (
+            values[cut:] for values in (per_digit, margins, runner_ups, alternatives))
+        confidence = min(per_digit)
     # No score here: it is made once, at the end, on the consumption (score_reading).
     tail = list(server)
     if confidence is not None:
@@ -744,7 +857,8 @@ def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: flo
                      digit_margin=margins, digit_runner_up=runner_ups, digit_alternatives=alternatives,
                      rolling=extract_rolling(content),
                      device_type=extract_device_type(content),
-                     decimal_digits=extract_decimal_digits(content))
+                     decimal_digits=extract_decimal_digits(content),
+                     clear=_clear_probability(choice), code_confidence=code_confidence)
 
 
 def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds: list,

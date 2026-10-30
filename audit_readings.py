@@ -11,11 +11,12 @@ from pathlib import Path
 import queue
 import re
 import sqlite3
+import sys
 import threading
 import time
 from evaluation import GROUPS as EVALUATION_GROUPS, SCORE_THRESHOLD, evaluate, lines as evaluation_lines
-from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, RETAKE_SCORE, WORKERS_PER_SLOT, _reading_digits, ocr_image,
-                              server_slots, extract_blank, extract_no_meter, score_reading)
+from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, RETAKE_SCORE, WORKERS_PER_SLOT, photo_retake_reason, _reading_digits, ocr_image,
+                              server_slots, extract_blank, extract_no_meter, low_score_reasons, score_reading)
 
 NAME = re.compile(r'^(?P<contract>[^_]+)_(?P<stamp>\d{14})_(?P<operator>[^_]*)_(?P<reading>\d+)__'
                   r'(?P<register>[^_]+)')
@@ -77,6 +78,9 @@ def connect(path, **options):
     return db
 
 
+MAX_DECIMALS = 3  # the most decimals a display shows (000000.123)
+
+
 def split_decimals(reading, saved, visual_decimals=None):
     saved = re.sub(r'\D', '', saved or '')
     reading = re.sub(r'\D', '', reading or '')  # a reading stored with its decimal point
@@ -90,9 +94,13 @@ def split_decimals(reading, saved, visual_decimals=None):
     if not saved:
         return reading.lstrip('0') or '0', None, 'no'
     saved_value = int(saved)
-    saved_digits = math.floor(math.log10(saved_value)) + 1 if saved_value else 1
+    # A saved 0 has no whole digits: its 0 is one of the display's leading zeros, so what
+    # follows them is decimals (000000.19 reads 0.19, not 1.9), at most MAX_DECIMALS of them.
+    saved_digits = math.floor(math.log10(saved_value)) + 1 if saved_value else 0
     leading_zeros = len(reading) - len(reading.lstrip('0'))
     decimals = max(0, len(reading) - leading_zeros - saved_digits)
+    if not saved_value:
+        decimals = min(decimals, MAX_DECIMALS)
     whole = int(reading) // 10 ** decimals
     return str(whole), decimals, 'yes' if whole == saved_value else 'no'
 
@@ -265,10 +273,11 @@ def read_scored(path, saved, model=None, scale=1.0):
     """One read of a photo with its consumption and its one score."""
     result = ocr_image(path, model=model, scale=scale)
     cells = _reading_digits(result.text) or ''
-    whole, decimals, match = split_decimals(cells or None, saved, result.decimal_digits)
-    parts = score_reading(cells, result.digit_confidence, decimals, result.digit_margin,
+    # Scored from the photo alone, then compared with the saved reading.
+    parts = score_reading(cells, result.digit_confidence, result.decimal_digits, result.digit_margin,
                           result.digit_runner_up, result.digit_alternatives,
                           result.device_type == 'mechanical') if cells else None
+    whole, decimals, match = split_decimals(cells or None, saved, result.decimal_digits)
     return dict(result=result, cells=cells, whole=whole, decimals=decimals, match=match, parts=parts,
                 score=parts['total'] if parts else None)
 
@@ -318,10 +327,18 @@ def read_one(path, month, model=None):
     else:
         status = 'done'
     whole, decimals, match, score = read['whole'], read['decimals'], read['match'], read['score']
+    # For the log only (not stored): the register code cut from the front, and why a photo is retaken.
+    answer = re.findall(r'READING:[ \t]*([^\n]*)', result.text, re.IGNORECASE)
+    written = re.sub(r'\D', '', answer[-1]) if answer else ''
+    code = written[:len(result.code_confidence or [])] or None
+    reason = photo_retake_reason(reading, result.clear) if reading else None
+    if not reason and score is not None and score < RETAKE_SCORE:
+        reason = low_score_reasons(read['parts'])[0] if read['parts'] else 'the overall confidence is low'
     return dict(row, model=model_backend(model).model, picture_name=path.name, extracted_reading=reading,
                 extracted_whole=whole, extracted_decimals=decimals, match=match,
                 status=status, score=score, visual_decimals=result.decimal_digits,
-                retake=int(score is not None and score < RETAKE_SCORE),
+                retake=int(bool(reason)), code=code, reason=reason,
+                too_long=bool(read['parts'] and read['parts'].get('too_long')),
                 seconds=round(read['seconds'] or time.monotonic() - started, 2), error=None)
 
 
@@ -345,7 +362,7 @@ def command_read(args):
     print(f'reading with {workers} worker(s) into {args.db}; model {choice.label}; model server slots: '
           f'{slots or "not reported"}', flush=True)
     started = time.monotonic()
-    count = matched = failed = 0
+    count = matched = failed = rejected = codes = too_long = 0
     saved_names_so_far = {row[0] for row in db.execute('SELECT picture_name FROM readings')}
     print(f'Resuming with {len(saved_names_so_far)} saved photos; completed photos are skipped.', flush=True)
     model_seconds = 0.0
@@ -405,7 +422,7 @@ def command_read(args):
             yield path
 
     def collect(done):
-        nonlocal count, matched, failed, model_seconds
+        nonlocal count, matched, failed, rejected, codes, too_long, model_seconds
         for future in done:
             row = future.result()
             save(db, row)
@@ -416,6 +433,9 @@ def command_read(args):
             count += 1
             matched += row['match'] == 'yes'
             failed += row['status'] == 'error'
+            rejected += bool(row.get('retake'))
+            codes += bool(row.get('code'))
+            too_long += bool(row.get('too_long'))
             model_seconds += row['seconds'] or 0
             if args.verbose:
                 result = (('MATCH' if row['match'] == 'yes' else 'MISMATCH') if row['status'] == 'done' else
@@ -427,16 +447,21 @@ def command_read(args):
                       f"| extracted by AI={row['extracted_whole'] or '-'} "
                       f"| raw digits={row['extracted_reading'] or '-'} | score={score} "
                       f"| {result} | photo={row['seconds']}s | elapsed={elapsed:.0f}s "
-                      f"| visual decimals={row['visual_decimals'] if row.get('visual_decimals') is not None else '-'}", flush=True)
+                      f"| visual decimals={row['visual_decimals'] if row.get('visual_decimals') is not None else '-'}"
+                      + (f" | code removed={row['code']}" if row.get('code') else '')
+                      + (f" | REJECTED: {row['reason']}" if row.get('reason') else ''), flush=True)
                 if row['error']:
                     print(f"  error: {row['error']}", flush=True)
             if count % args.progress == 0:
-                rate = count / (time.monotonic() - started)
+                elapsed = time.monotonic() - started
+                rate = count / elapsed
                 # failed: photos the model server could not answer at all (not mismatches),
                 # shown only when there are any
-                print(f'{len(saved_names_so_far)} total saved; {count} read this run, {rate:.2f} photos/s ({rate * 86400:,.0f}/day), '
-                      f'{model_seconds / count:.1f} s per photo, {100 * matched / count:.1f}% match'
-                      + (f', {failed} failed (model server gave no answer; --only-failed reads them again)'
+                print(f'PROGRESS {len(saved_names_so_far)} total saved; {count} read this run in {elapsed / 60:.0f} min, '
+                      f'{rate:.2f} photos/s ({rate * 86400:,.0f}/day), {model_seconds / count:.1f} s per photo | '
+                      f'{100 * matched / count:.1f}% match, {rejected} rejected ({100 * rejected / count:.1f}%), '
+                      f'{codes} register codes removed, {too_long} with 12+ digits'
+                      + (f' | {failed} failed (model server gave no answer; --only-failed reads them again)'
                          if failed else ''), flush=True)
         report_every = getattr(args, 'report_every', 1000)
         if report_every and count - last_report_count >= report_every:
@@ -646,7 +671,7 @@ def list_query(kind, month=None, contract=None):
 
 
 # One result line of `read --verbose`.
-_LOG_LINE = re.compile(r'^\[\d+(?: this run \| \d+ saved)?\] (?P<name>\S+) \| saved by system=(?P<saved>\S+) \| extracted by AI=\S+ '
+_LOG_LINE = re.compile(r'^(?:\d{4}-\d\d-\d\d \d\d:\d\d:\d\d )?\[\d+(?: this run \| \d+ saved)?\] (?P<name>\S+) \| saved by system=(?P<saved>\S+) \| extracted by AI=\S+ '
                        r'\| raw digits=(?P<raw>\S+) \| score=(?P<score>\S+) \| (?P<result>[A-Z_]+) '
                        r'\| photo=(?P<seconds>[\d.]+)s')
 
@@ -780,6 +805,44 @@ def command_report(args):
         db.close()
 
 
+class _LogTee:
+    """Everything a run prints, each line starting with the time, written both to the
+    terminal and to a log file, so the record survives a dropped connection."""
+
+    def __init__(self, stream, log, lock):
+        self.stream, self.log, self.lock, self.line_start = stream, log, lock, True
+
+    def write(self, text):
+        with self.lock:
+            out = []
+            for piece in text.splitlines(keepends=True):
+                if self.line_start:
+                    out.append(datetime.now().strftime('%Y-%m-%d %H:%M:%S '))
+                out.append(piece)
+                self.line_start = piece.endswith('\n')
+            out = ''.join(out)
+            self.stream.write(out)
+            self.log.write(out)
+        return len(text)
+
+    def flush(self):
+        self.stream.flush()
+        self.log.flush()
+
+    def __getattr__(self, name):  # encoding, isatty, ... of the terminal
+        return getattr(self.stream, name)
+
+
+def log_to_file(path):
+    """Send stdout and stderr (tracebacks included) to the terminal and to path, timestamped."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log, lock = path.open('a', encoding='utf-8', buffering=1), threading.Lock()
+    sys.stdout = _LogTee(sys.stdout, log, lock)
+    sys.stderr = _LogTee(sys.stderr, log, lock)
+    print(f'Log file: {path.resolve()}', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--db', default=str(AUDIT_DB))
@@ -803,6 +866,9 @@ def main():
     read.add_argument('--verbose', action='store_true', help='print the file name, saved and AI readings, score and result for every photo')
     read.add_argument('--word-dir', default='reports', help='folder for the Word report of the run')
     read.add_argument('--no-word', action='store_true', help='do not write the Word report')
+    read.add_argument('--log', help='log file for everything the run prints, each line timestamped '
+                                    '(default: <word-dir>/logs/read_<date>_<time>.log)')
+    read.add_argument('--no-log', action='store_true', help='print to the terminal only, write no log file')
     read.set_defaults(run=command_read)
 
     imported = commands.add_parser('import-log', help='store the results of a saved `read --verbose` output, '
@@ -826,6 +892,9 @@ def main():
             parser.error('read requires photo folders or --files-csv')
         if args.files_csv and (args.folders or args.only_failed):
             parser.error('--files-csv cannot be combined with folders or --only-failed')
+        if not args.no_log:
+            log_to_file(args.log or Path(args.word_dir) / 'logs' / f'read_{datetime.now():%Y%m%d_%H%M%S}.log')
+            print('Command: ' + ' '.join(sys.argv), flush=True)
     args.run(args)
 
 
