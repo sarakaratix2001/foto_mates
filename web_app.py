@@ -28,7 +28,7 @@ from audit_readings import (AUDIT_DB, LIST_KINDS, connect as audit_connect, list
                             split_decimals, summary as audit_summary)
 from evaluation import LABELS as EVALUATION_LABELS, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, OCR_MODEL, PHOTO_TYPES, QUALITY_DIGIT, QUALITY_SCORE,
-                              RETAKE_SCORE, _reading_digits, backend as model_backend, extract_blank, extract_no_meter, score_reading,
+                              RETAKE_SCORE, _reading_digits, photo_retake_reason, backend as model_backend, extract_blank, extract_no_meter, score_reading,
                               WORKERS_PER_SLOT, low_score_reasons, ocr_image, quality_reasons,
                               server_slots, warm_up)
 
@@ -83,8 +83,8 @@ def quality_note(score, parts, seconds=None):
     return note
 
 
-def verdict(reading, score=None, parts=None, seconds=None, text=None):
-   
+def verdict(reading, score=None, parts=None, seconds=None, text=None, clear=None, cells=None):
+
     if not reading and extract_blank(text):
         return dict(status='blank', retake=True, quality_note=None,
                     retake_reason='the photo is blank: nothing recognisable in it')
@@ -95,6 +95,10 @@ def verdict(reading, score=None, parts=None, seconds=None, text=None):
         return dict(status='no_digits', retake=True, quality_note=None,
                     retake_reason='no reading could be taken from the photo')
     note = quality_note(score, parts, seconds)
+    photo = photo_retake_reason(cells or '', clear)
+    if photo:
+        return dict(status='done', retake=True, quality_note=note, retake_reason=(
+            f'{photo}: retake the photo straight on, sharp and without glare, with the whole display in the frame'))
     if score is not None and score < RETAKE_SCORE:
         reasons = '; '.join(low_score_reasons(parts)) if parts else 'the overall confidence is low'
         return dict(status='done', retake=True, quality_note=note, retake_reason=(
@@ -108,11 +112,12 @@ def consumption(filename, cells, per_digit=None, margins=None, runner_ups=None, 
 
     cells = re.sub(r'\D', '', cells or '')
     stored = parse_name(Path(filename or '').name)['saved_reading']
-    whole, decimals, match = split_decimals(cells or None, stored,
-                                           decimal_digits if device_type == 'mechanical' else None)
-    # The one score, made here at the end, on the consumption's digits alone.
-    parts = score_reading(cells, per_digit, decimals, margins, runner_ups, alternatives,
+    visual = decimal_digits if device_type == 'mechanical' else None
+    # The one score, from the photo alone: every digit read, nothing from the file name.
+    parts = score_reading(cells, per_digit, visual, margins, runner_ups, alternatives,
                           device_type == 'mechanical') if cells else None
+    # Only then the comparison with the saved reading in the file name.
+    whole, decimals, match = split_decimals(cells or None, stored, visual)
     return dict(reading=whole or '', all_digits=cells, digits=list(whole or ''), whole_reading=whole,
                 stored_reading=stored, decimals=decimals, match=match if stored and cells else None,
                 score=parts['total'] if parts else None, score_parts=parts)
@@ -126,7 +131,7 @@ def with_verdicts(job):
                                     item.get('digit_runner_up'), item.get('digit_alternatives'),
                                     item.get('device_type'), item.get('decimal_digits')))
             item.update(verdict(item.get('reading'), item.get('score'), item.get('score_parts'),
-                                item.get('seconds'), item.get('raw_text')))
+                                item.get('seconds'), item.get('raw_text'), item.get('clear'), item.get('all_digits')))
     job['evaluation'] = batch_evaluation(job)
     job['evaluation_lines'] = evaluation_lines(job['evaluation'])
     return job
@@ -167,7 +172,9 @@ def process_image(job, item):
                     digit_margin=result.digit_margin, digit_runner_up=result.digit_runner_up,
                     digit_alternatives=result.digit_alternatives,
                     rolling=result.rolling, device_type=result.device_type, decimal_digits=result.decimal_digits,
-                    **verdict(reading, read['score'], read['score_parts'], text=result.text))
+                    clear=result.clear, code_confidence=result.code_confidence,
+                    **verdict(reading, read['score'], read['score_parts'], text=result.text,
+                              clear=result.clear, cells=read['all_digits']))
     except Exception as exc:
         item.update(status='error', error=str(exc),
                     raw_text=getattr(exc, 'breakdown', '').lstrip('\n'))
@@ -393,7 +400,9 @@ def read_now(image: UploadFile = File(...)):
         **read,
         'reading': reading or None,
         'reread': best['reread'],
-        **verdict(reading, read['score'], read['score_parts'], seconds),
+        **verdict(reading, read['score'], read['score_parts'], seconds,
+                  clear=result.clear, cells=read['all_digits']),
+        'clear': result.clear,
         'seconds': seconds,
         'evidence_source': result.evidence_source,
         'confidence': result.confidence,
