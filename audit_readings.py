@@ -49,11 +49,40 @@ CREATE TABLE IF NOT EXISTS readings (
     error             TEXT,
     read_at           TEXT NOT NULL,
     model             TEXT,     -- the model that read the photo
-    visual_decimals   INTEGER   -- visually identified mechanical fractional wheels, or NULL
+    visual_decimals   INTEGER,  -- visually identified mechanical fractional wheels, or NULL
+    clear             REAL,     -- the model's chance of QUALITY: CLEAR, 0..1 (information only)
+    quality           TEXT      -- the model's QUALITY answer, CLEAR or POOR (information only)
 ) WITHOUT ROWID;  -- the rows live in the picture_name index itself: one copy, smaller file
 CREATE INDEX IF NOT EXISTS readings_month ON readings(month, status, match);
 CREATE INDEX IF NOT EXISTS readings_contract ON readings(contract_id, month, register);
 """
+
+# Everything else known about a read, kept so a result can be checked or a rule applied
+# again later without reading the photo again. Added to old databases on connect.
+DETAIL_COLUMNS = (
+    ('operator', 'TEXT'),               # who took the photo, from the file name
+    ('latitude', 'REAL'),               # where, from the file name (41-35034332 -> 41.35034332)
+    ('longitude', 'REAL'),
+    ('device_type', 'TEXT'),            # digital / mechanical, as the model answered TYPE
+    ('digit_probabilities', 'TEXT'),    # one per digit of extracted_reading, e.g. "0.982 1.000 0.931"
+    ('second_choices', 'TEXT'),         # per digit, the likeliest other digit: "7:0.120 -:- 0:0.010"
+    ('weakest_digit', 'REAL'),          # the lowest of digit_probabilities
+    ('code_removed', 'TEXT'),           # register code cut from the front of READING (380, 1580, ...)
+    ('code_probabilities', 'TEXT'),     # one per digit of code_removed
+    ('reject_reason', 'TEXT'),          # why retake is 1
+    ('too_many_digits', 'INTEGER'),     # 1: 12 or more digits read, score set to 0
+    ('rolling', 'TEXT'),                # mechanical wheels caught turning, e.g. "6:6-7"
+    ('reread', 'INTEGER'),              # 1: read a second time, enlarged, after an unsure first read
+    ('photo_sent', 'TEXT'),             # what the model saw: original / enlarged(2x) / enhanced(is_dark,...)
+    ('image_width', 'INTEGER'),         # the photo as stored, in pixels
+    ('image_height', 'INTEGER'),
+    ('blur', 'REAL'),                   # image checks before the read (higher blur value: sharper)
+    ('contrast', 'REAL'),
+    ('brightness', 'REAL'),
+    ('glare_fraction', 'REAL'),
+    ('image_flags', 'TEXT'),            # is_blurry, is_dark, has_glare, ... that were true
+    ('model_answer', 'TEXT'),           # the model's whole answer, with the timing lines after it
+)
 
 
 def connect(path, **options):
@@ -62,15 +91,23 @@ def connect(path, **options):
     db.execute('PRAGMA synchronous=FULL')
     db.executescript(SCHEMA)
     present = {column[1] for column in db.execute('PRAGMA table_info(readings)')}
-    for name, kind in (('model', 'TEXT'), ('extracted_decimals', 'INTEGER'), ('visual_decimals', 'INTEGER')):
+    added = (('model', 'TEXT'), ('extracted_decimals', 'INTEGER'), ('visual_decimals', 'INTEGER'),
+             ('clear', 'REAL'), ('quality', 'TEXT'), *DETAIL_COLUMNS)
+    for name, kind in added:
         if name not in present:  # a database from before the column
             db.execute(f'ALTER TABLE readings ADD COLUMN {name} {kind}')
+    attempts = {column[1] for column in db.execute('PRAGMA table_info(reading_attempts)')}
+    for name, kind in added:
+        if attempts and name not in attempts:  # the copy of earlier results gets the column too
+            db.execute(f'ALTER TABLE reading_attempts ADD COLUMN {name} {kind}')
     # Preserve the previous result of every image when a retry replaces the
     # current row. The trigger also covers writers already running older code.
     db.execute('CREATE TABLE IF NOT EXISTS reading_attempts AS SELECT * FROM readings')
     columns = ','.join(COLUMNS)
     values = ','.join('NEW.' + column for column in COLUMNS)
-    db.execute(f'''CREATE TRIGGER IF NOT EXISTS readings_record_attempt
+    # Made again on every connect, so a database from before a new column also records it.
+    db.execute('DROP TRIGGER IF EXISTS readings_record_attempt')
+    db.execute(f'''CREATE TRIGGER readings_record_attempt
         AFTER INSERT ON readings BEGIN
         INSERT INTO reading_attempts ({columns}) VALUES ({values}); END''')
     db.execute('CREATE INDEX IF NOT EXISTS reading_attempts_picture ON reading_attempts(picture_name, read_at)')
@@ -305,8 +342,51 @@ def read_best(path, saved, model=None):
     return dict(best, reread=True, seconds=seconds)
 
 
+_PLACE = re.compile(r'_(\d+)-(\d+)_(\d+)-(\d+)\.[^.]+$')
+
+
+def name_details(name):
+    """The operator and the coordinates the file name carries (…_OPERATOR_…_41-35034332_19-86586937.jpg)."""
+    match, place = NAME.match(name), _PLACE.search(name)
+    lat = lon = None
+    if place and place[1] != '0':
+        lat, lon = float(f'{place[1]}.{place[2]}'), float(f'{place[3]}.{place[4]}')
+    return dict(operator=(match['operator'] or None) if match else None, latitude=lat, longitude=lon)
+
+
+def read_details(result, reading, reread):
+    """What a read knows beyond the reading: per-digit probabilities and second choices,
+    the register code cut off, the model's answer and what it was shown."""
+    def numbers(values):
+        return ' '.join(f'{p:.3f}' for p in values) if values else None
+    probabilities = list(result.digit_confidence or [])
+    aligned = reading is not None and len(probabilities) == len(reading)
+    second = []
+    for index, options in enumerate(result.digit_alternatives or [] if aligned else []):
+        others = sorted(((p, d) for d, p in (options or {}).items() if d != reading[index]), reverse=True)
+        second.append(f'{others[0][1]}:{others[0][0]:.3f}' if others else '-:-')
+    image = result.image_report or {}
+    flags = [name for name, value in image.items() if name.startswith(('is_', 'has_')) and value]
+    answer = re.findall(r'READING:[ \t]*([^\n]*)', result.text, re.IGNORECASE)
+    written = re.sub(r'\D', '', answer[-1]) if answer else ''
+    return dict(
+        device_type=result.device_type,
+        digit_probabilities=numbers(probabilities) if aligned else None,
+        second_choices=' '.join(second) or None,
+        weakest_digit=round(min(probabilities), 3) if aligned and probabilities else None,
+        code_removed=written[:len(result.code_confidence or [])] or None,
+        code_probabilities=numbers(result.code_confidence),
+        rolling=', '.join(f"{w['position']}:{w['lower']}-{w['upper']}" if w.get('position') else 'turning'
+                          for w in result.rolling or []) or None,
+        reread=int(bool(reread)), photo_sent=result.evidence_source,
+        image_width=image.get('width'), image_height=image.get('height'),
+        blur=image.get('blur_variance'), contrast=image.get('contrast'), brightness=image.get('brightness'),
+        glare_fraction=image.get('glare_fraction'), image_flags=','.join(flags) or None,
+        model_answer=result.text)
+
+
 def read_one(path, month, model=None):
-    row = parse_name(path.name, month)
+    row = dict(parse_name(path.name, month), **name_details(path.name))
     started = time.monotonic()
     try:
         read = read_best(path, row['saved_reading'], model)
@@ -327,24 +407,27 @@ def read_one(path, month, model=None):
     else:
         status = 'done'
     whole, decimals, match, score = read['whole'], read['decimals'], read['match'], read['score']
-    # For the log only (not stored): the register code cut from the front, and why a photo is retaken.
-    answer = re.findall(r'READING:[ \t]*([^\n]*)', result.text, re.IGNORECASE)
-    written = re.sub(r'\D', '', answer[-1]) if answer else ''
-    code = written[:len(result.code_confidence or [])] or None
+    quality = re.findall(r'^QUALITY:[ \t]*\**[ \t]*(CLEAR|POOR)', result.text, re.IGNORECASE | re.MULTILINE)
     reason = photo_retake_reason(reading, result.clear) if reading else None
     if not reason and score is not None and score < RETAKE_SCORE:
         reason = low_score_reasons(read['parts'])[0] if read['parts'] else 'the overall confidence is low'
-    return dict(row, model=model_backend(model).model, picture_name=path.name, extracted_reading=reading,
+    details = read_details(result, reading, read.get('reread'))
+    too_long = bool(read['parts'] and read['parts'].get('too_long'))
+    return dict(row, **details, model=model_backend(model).model, picture_name=path.name, extracted_reading=reading,
                 extracted_whole=whole, extracted_decimals=decimals, match=match,
                 status=status, score=score, visual_decimals=result.decimal_digits,
-                retake=int(bool(reason)), code=code, reason=reason,
-                too_long=bool(read['parts'] and read['parts'].get('too_long')),
+                clear=None if result.clear is None else round(result.clear, 3),
+                quality=quality[-1].upper() if quality else None,
+                retake=int(bool(reason)), reject_reason=reason, too_many_digits=int(too_long),
+                # the same, under the names the run's log lines use
+                code=details['code_removed'], reason=reason, too_long=too_long,
                 seconds=round(read['seconds'] or time.monotonic() - started, 2), error=None)
 
 
 COLUMNS = ('picture_name', 'contract_id', 'date', 'month', 'register', 'saved_reading',
            'extracted_reading', 'extracted_whole', 'extracted_decimals', 'match', 'status', 'score',
-           'retake', 'seconds', 'error', 'read_at', 'model', 'visual_decimals')
+           'retake', 'seconds', 'error', 'read_at', 'model', 'visual_decimals', 'clear', 'quality',
+           *(name for name, _ in DETAIL_COLUMNS))
 
 
 def save(db, row):
@@ -448,6 +531,8 @@ def command_read(args):
                       f"| raw digits={row['extracted_reading'] or '-'} | score={score} "
                       f"| {result} | photo={row['seconds']}s | elapsed={elapsed:.0f}s "
                       f"| visual decimals={row['visual_decimals'] if row.get('visual_decimals') is not None else '-'}"
+                      + (f" | quality={row['quality'] or '-'} ({100 * row['clear']:.0f}% clear, info only)"
+                         if row.get('clear') is not None else '')
                       + (f" | code removed={row['code']}" if row.get('code') else '')
                       + (f" | REJECTED: {row['reason']}" if row.get('reason') else ''), flush=True)
                 if row['error']:
@@ -629,7 +714,7 @@ def _month(month):
 # every digit as read and how many of them were stripped as decimals.
 _PICKED = ('picture_name, contract_id, date, register, saved_reading, extracted_whole AS read_reading, '
            'match, extracted_reading AS all_digits_read, extracted_decimals AS decimals_stripped, '
-           'status, score, seconds, model')
+           'status, score, seconds, model, clear AS clear_info_only, quality AS quality_info_only')
 
 
 def list_query(kind, month=None, contract=None):
@@ -765,7 +850,15 @@ def export_reports(db, out, month=None, full=False, quiet=False):
                     WHEN score >= {SCORE_THRESHOLD} THEN 'Mismatch - high score'
                     WHEN score < {SCORE_THRESHOLD} THEN 'Mismatch - low score'
                     ELSE 'Mismatch - no score' END AS "Result",
-               model AS "AI model", error AS "Error"
+               model AS "AI model", error AS "Error",
+               CASE WHEN retake = 1 THEN 'yes' WHEN retake = 0 THEN 'no' END AS "Rejected",
+               reject_reason AS "Why rejected", device_type AS "Meter type",
+               digit_probabilities AS "Digit probabilities", second_choices AS "Second choices",
+               weakest_digit AS "Weakest digit", code_removed AS "Code removed",
+               code_probabilities AS "Code probabilities", too_many_digits AS "12+ digits",
+               reread AS "Read twice", photo_sent AS "Photo sent to model",
+               clear AS "Chance of CLEAR (info only)", quality AS "Quality (info only)",
+               operator AS "Operator", latitude AS "Latitude", longitude AS "Longitude"
         FROM readings {comparison_filter} ORDER BY month, picture_name
     ''', [_month(month)] if month else []))
     counts = {kind: write_csv(out / f'{kind}.csv', db.execute(*list_query(kind, month)))
@@ -789,6 +882,10 @@ def export_reports(db, out, month=None, full=False, quiet=False):
         for month in months:
             month = month or 'unknown'
             write_csv(out / f'all_readings_{month}.csv', db.execute(*list_query('all', month)))
+            # Every column of every photo, the model's whole answer and the image checks included.
+            write_csv(out / f'details_{month}.csv', db.execute(
+                'SELECT * FROM readings WHERE month IS ? ORDER BY picture_name',
+                [None if month == 'unknown' else _month(month)]))
 
     if not quiet:
         print(f'{out}: summary.csv, ' + ', '.join(f'{kind}.csv ({rows})' for kind, rows in counts.items())

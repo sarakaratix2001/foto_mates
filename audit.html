@@ -77,7 +77,7 @@ const $=id=>document.getElementById(id);
 const escape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=v=>v==null?'–':typeof v==='number'?v.toLocaleString():escape(v);
 const NUMERIC=new Set(['photos','read_correctly','mismatch','missing_reading','no_saved_reading','failed','percent_correct','contracts','seconds_per_photo','score','seconds','decimals_stripped']);
-const LABELS={picture_name:'Picture',contract_id:'Contract',date:'Date',month:'Month',register:'Register',saved_reading:'Stored in system',read_reading:'Read from photo',all_digits_read:'All digits read',decimals_stripped:'Decimals stripped',match:'Match',status:'Status',score:'Score',seconds:'Seconds',model:'Model',error:'Error',photos:'Photos',retake:'Retake',read_at:'Read at'};
+const LABELS={picture_name:'Picture',contract_id:'Contract',date:'Date',month:'Month',register:'Register',saved_reading:'Stored in system',read_reading:'Read from photo',all_digits_read:'All digits read',decimals_stripped:'Decimals stripped',match:'Match',status:'Status',score:'Score',seconds:'Seconds',model:'Model',error:'Error',photos:'Photos',retake:'Retake',read_at:'Read at',clear_info_only:'Chance of CLEAR (info only)',quality_info_only:'Quality (info only)'};
 let state={kind:'mismatches',month:'',contract:'',page:0};
 
 async function api(url){const r=await fetch(url);const d=await r.json();if(!r.ok)throw Error(d.error||'Request failed');return d}
