@@ -219,6 +219,9 @@ _GLUED_CODE = re.compile(r"^(?:1\d|[1-9])[5-8]\d(?=0\d{5})")
 # 11-digit reading that starts with one has the code glued on, as no meter shows 11
 # digits of its own. 1588 and 1589 are 15.8.0 with its last 0 misread.
 _ELEVEN_DIGIT_CODES = ('1588', '1580', '1589', '380', '580', '680', '390', '300')
+# Up to 9 digits a reading can be a real one that only looks like code + reading
+# (178 064558 is 178064.558 on a 9-digit display), so there only these codes are cut.
+_SHORT_GLUED_CODES = ('1580', '158', '180', '380', '580', '680')
 
 
 def _strip_code(digits: str, code: str) -> str:
@@ -231,7 +234,9 @@ def _strip_code(digits: str, code: str) -> str:
             and len(digits) - len(code_digits) >= 4:
         return digits[len(code_digits):]
     glued = _GLUED_CODE.match(digits)
-    return digits[glued.end():] if glued else digits
+    if glued and (len(digits) >= 10 or digits[:glued.end()] in _SHORT_GLUED_CODES):
+        return digits[glued.end():]
+    return digits
 
 def extract_device_type(text: str) -> str | None:
     types = re.findall(r"TYPE:[ \t]*\**[ \t]*(DIGITAL|MECHANICAL)", text, re.IGNORECASE)
@@ -344,6 +349,7 @@ class OcrResult:
     decimal_digits: int | None = None        # visually marked fractional wheels; 0 means none
     clear: float | None = None               # the model's probability that the photo is CLEAR, 0..1
     code_confidence: list | None = None      # per digit of a register code cut from the front of READING
+    image_report: dict | None = None         # the photo's size and quality checks (blur, contrast, glare, ...)
     reading_seconds: float | None = None     # the model reading the photo plus digit extraction
     sent_png: bytes | None = None            # the enhanced photo the model read; None: it read the original
 
@@ -858,7 +864,8 @@ def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: flo
                      rolling=extract_rolling(content),
                      device_type=extract_device_type(content),
                      decimal_digits=extract_decimal_digits(content),
-                     clear=_clear_probability(choice), code_confidence=code_confidence)
+                     clear=_clear_probability(choice), code_confidence=code_confidence,
+                     image_report={k: v for k, v in report.items() if k != 'sent_image'})
 
 
 def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds: list,
@@ -867,6 +874,7 @@ def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds
     report = dict(blur_variance=0.0)
     needs = []
     original = timed('decode image', lambda: decode_image(image_path))
+    size = dict(width=int(original.shape[1]), height=int(original.shape[0]))
     # A small photo is enlarged until its shorter side reaches _MIN_SIDE: on a
     # 240x400 photo a digit is ~10 px, smaller than one image patch of the model.
     scale = max(scale, _MIN_SIDE / min(original.shape[:2]))
@@ -891,7 +899,7 @@ def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds
         encoded = timed('read photo file', lambda: photo_data_url(image_path))
         aids.append('original')
     # The photo as prepared is what the model reads, never the original beside it.
-    report = dict(report, sent_image=encoded if needs or enlarged else None)
+    report = dict(report, **size, sent_image=encoded if needs or enlarged else None)
 
     images = [
         {"type": "text", "text": "Meter photo."},
