@@ -24,8 +24,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from audit_readings import (AUDIT_DB, LIST_KINDS, connect as audit_connect, list_query, parse_name, read_best,
-                            split_decimals, summary as audit_summary)
+from audit_readings import (AUDIT_DB, LIST_KINDS, connect as audit_connect, excel_row, list_query, parse_name,
+                            read_best, split_decimals, summary as audit_summary)
 from evaluation import LABELS as EVALUATION_LABELS, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, OCR_MODEL, PHOTO_TYPES, QUALITY_DIGIT, QUALITY_SCORE,
                               RETAKE_SCORE, _reading_digits, photo_retake_reason, backend as model_backend, extract_blank, extract_no_meter, score_reading,
@@ -483,9 +483,10 @@ def audit_export(kind: str = Query('mismatches', pattern=AUDIT_KIND),
             buffer = io.StringIO()
             writer = csv.writer(buffer)
             buffer.write('\ufeff')  # Excel opens it as UTF-8
-            writer.writerow([column[0] for column in cursor.description])
+            columns = [column[0] for column in cursor.description]
+            writer.writerow(columns)
             for row in cursor:
-                writer.writerow(row)
+                writer.writerow(excel_row(columns, row))
                 if buffer.tell() > 1 << 16:
                     yield buffer.getvalue()
                     buffer.seek(0)

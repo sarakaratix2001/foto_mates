@@ -14,7 +14,7 @@ import sqlite3
 import sys
 import threading
 import time
-from evaluation import GROUPS as EVALUATION_GROUPS, SCORE_THRESHOLD, evaluate, lines as evaluation_lines
+from evaluation import GROUPS as EVALUATION_GROUPS, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, RETAKE_SCORE, WORKERS_PER_SLOT, photo_retake_reason, _reading_digits, ocr_image,
                               server_slots, extract_blank, extract_no_meter, low_score_reasons, score_reading)
 
@@ -689,8 +689,8 @@ def summary(db, month=None):
                COUNT(*) AS photos,
                SUM(match = 'yes') AS read_correctly,
                SUM(status = 'done' AND match = 'no') AS mismatch,
-               SUM(status = 'done' AND match = 'no' AND score >= {SCORE_THRESHOLD}) AS mismatch_high_score,
-               SUM(status = 'done' AND match = 'no' AND score < {SCORE_THRESHOLD}) AS mismatch_low_score,
+               SUM(status = 'done' AND match = 'no' AND score >= {RETAKE_SCORE}) AS mismatch_high_score,
+               SUM(status = 'done' AND match = 'no' AND score < {RETAKE_SCORE}) AS mismatch_low_score,
                SUM(status = 'done' AND match = 'no' AND score IS NULL) AS mismatch_no_score,
                SUM(status = 'missing') AS missing_reading,
                SUM(status = 'no_meter') AS no_meter,
@@ -813,16 +813,29 @@ def command_rematch(args):
     print(f'{total} readings matched again, {changed} changed', flush=True)
 
 
+# Columns holding digits as read, leading zeros included: Excel opens 0205164 as the number 205164.
+DIGIT_TEXT_COLUMNS = {'Raw digits', 'all_digits_read', 'extracted_reading', 'Code removed', 'code_removed'}
+
+
+def excel_row(columns, row):
+    """A report row as Excel should show it: digits starting with 0 are written ="0205164",
+    which Excel shows as 0205164 instead of turning it into a number."""
+    return [f'="{value}"' if column in DIGIT_TEXT_COLUMNS and isinstance(value, str)
+            and len(value) > 1 and value[0] == '0' and value.isdigit() else value
+            for column, value in zip(columns, row)]
+
+
 def write_csv(path, cursor):
     path = Path(path)
     temporary = path.with_name(path.name + '.tmp')
     try:
         with temporary.open('w', newline='', encoding='utf-8-sig') as handle:
             writer = csv.writer(handle)
-            writer.writerow([column[0] for column in cursor.description])
+            columns = [column[0] for column in cursor.description]
+            writer.writerow(columns)
             rows = 0
             for row in cursor:
-                writer.writerow(row)
+                writer.writerow(excel_row(columns, row))
                 rows += 1
             handle.flush()
             os.fsync(handle.fileno())
@@ -847,8 +860,8 @@ def export_reports(db, out, month=None, full=False, quiet=False):
                     WHEN status = 'missing' THEN 'No readable digits'
                     WHEN status = 'no_saved_reading' THEN 'No saved reading'
                     WHEN match = 'yes' THEN 'Match'
-                    WHEN score >= {SCORE_THRESHOLD} THEN 'Mismatch - high score'
-                    WHEN score < {SCORE_THRESHOLD} THEN 'Mismatch - low score'
+                    WHEN score >= {RETAKE_SCORE} THEN 'Mismatch - high score'
+                    WHEN score < {RETAKE_SCORE} THEN 'Mismatch - low score'
                     ELSE 'Mismatch - no score' END AS "Result",
                model AS "AI model", error AS "Error",
                CASE WHEN retake = 1 THEN 'yes' WHEN retake = 0 THEN 'no' END AS "Rejected",
@@ -866,7 +879,7 @@ def export_reports(db, out, month=None, full=False, quiet=False):
     mismatch_sql, mismatch_params = list_query('mismatches', month)
     for label, condition in (('high_score', 'score >= ?'), ('low_score', 'score < ?')):
         write_csv(out / f'mismatches_{label}.csv', db.execute(
-            f'SELECT * FROM ({mismatch_sql}) WHERE {condition}', [*mismatch_params, SCORE_THRESHOLD]))
+            f'SELECT * FROM ({mismatch_sql}) WHERE {condition}', [*mismatch_params, RETAKE_SCORE]))
     for label, status in (('no_digits', 'missing'), ('no_meter', 'no_meter'), ('blank', 'blank'),
                           ('no_saved_reading', 'no_saved_reading'), ('errors', 'error')):
         write_csv(out / f'{label}.csv', db.execute(
