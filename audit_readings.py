@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from evaluation import GROUPS as EVALUATION_GROUPS, evaluate, lines as evaluation_lines
-from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, RETAKE_SCORE, WORKERS_PER_SLOT, photo_retake_reason, _reading_digits, ocr_image,
+from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, RETAKE_SCORE, WORKERS_PER_SLOT, photo_bytes, photo_retake_reason, _reading_digits, ocr_image,
                               server_slots, extract_blank, extract_no_meter, low_score_reasons, score_reading)
 
 NAME = re.compile(r'^(?P<contract>[^_]+)_(?P<stamp>\d{14})_(?P<operator>[^_]*)_(?P<reading>\d+)__'
@@ -385,11 +385,31 @@ def read_details(result, reading, reread):
         model_answer=result.text)
 
 
+# A photo whose read fails (the share or the model server gone for a moment) is read again
+# this many times, after these waits in seconds, before it is saved as an error.
+PHOTO_RETRIES = int(os.environ.get('FOTOMATES_PHOTO_RETRIES', '3'))
+RETRY_WAITS = (2, 5, 10)
+
+
+def read_with_retries(path, saved, model=None):
+    for attempt in range(PHOTO_RETRIES + 1):
+        try:
+            return read_best(path, saved, model)
+        except Exception as exc:
+            if attempt == PHOTO_RETRIES:
+                raise
+            wait = RETRY_WAITS[min(attempt, len(RETRY_WAITS) - 1)]
+            print(f'retry {attempt + 1}/{PHOTO_RETRIES} in {wait} s: {path.name}: '
+                  f'{type(exc).__name__}: {str(exc)[:160]}', flush=True)
+            time.sleep(wait)
+            photo_bytes.cache_clear()  # never read again a copy taken while the share was failing
+
+
 def read_one(path, month, model=None):
     row = dict(parse_name(path.name, month), **name_details(path.name))
     started = time.monotonic()
     try:
-        read = read_best(path, row['saved_reading'], model)
+        read = read_with_retries(path, row['saved_reading'], model)
         result = read['result']
     except Exception as exc:
         return dict(row, model=model_backend(model).model, picture_name=path.name, extracted_reading=None, extracted_whole=None,
@@ -455,8 +475,11 @@ def command_read(args):
     last_report_count = 0
 
     progress_dir = Path(args.word_dir) / 'progress'
-    failure_csv = progress_dir / 'retry_failures.csv'
-    print(f'Technical failures are saved immediately to: {failure_csv}', flush=True)
+    # Failures are always in the database (status error, read again by --only-failed);
+    # this CSV of them is written only with --all-reports.
+    failure_csv = progress_dir / 'retry_failures.csv' if args.all_reports else None
+    if failure_csv:
+        print(f'Technical failures are saved immediately to: {failure_csv}', flush=True)
     # Checkpoint reports are written in a thread of their own, with their own
     # database connection (WAL lets it read while results are being written):
     # exporting the whole database (seconds) no longer stops photos being sent.
@@ -465,8 +488,10 @@ def command_read(args):
 
     def write_reports(connection):
         try:
-            export_reports(connection, progress_dir, args.month, full=True, quiet=True)
+            totals = export_reports(connection, progress_dir, args.month, quiet=True, everything=args.all_reports)
             print(f'Reports saved: {progress_dir} (all saved results in this database for the selected month)', flush=True)
+            for line in summary_lines(totals):
+                print(f'SUMMARY {line}', flush=True)
         except Exception as exc:
             print(f'Report export could not finish: {exc}. Results remain saved in {args.db}.', flush=True)
 
@@ -510,7 +535,7 @@ def command_read(args):
             row = future.result()
             save(db, row)
             db.commit()  # a printed result is already durable, even after a disconnect
-            if row['status'] == 'error':
+            if row['status'] == 'error' and failure_csv:
                 record_retry_failure(failure_csv, row)
             saved_names_so_far.add(row['picture_name'])
             count += 1
@@ -845,16 +870,8 @@ def write_csv(path, cursor):
         temporary.unlink(missing_ok=True)
 
 
-def export_reports(db, out, month=None, full=False, quiet=False):
-    out = Path(out)
-    out.mkdir(parents=True, exist_ok=True)
-    write_csv(out / 'summary.csv', summary(db, month))
-    comparison_filter = 'WHERE month IS ?' if month else ''
-    write_csv(out / 'comparison.csv', db.execute(f'''
-        SELECT picture_name AS "File name", saved_reading AS "Saved by system",
-               extracted_whole AS "Extracted by AI", extracted_reading AS "Raw digits",
-               extracted_decimals AS "Digits stripped", score AS "Score",
-               CASE WHEN status = 'error' THEN 'Processing error'
+# A photo's result in words, as the reports show it.
+_RESULT = f'''CASE WHEN status = 'error' THEN 'Processing error'
                     WHEN status = 'no_meter' THEN 'No meter'
                     WHEN status = 'blank' THEN 'Blank photo'
                     WHEN status = 'missing' THEN 'No readable digits'
@@ -862,7 +879,64 @@ def export_reports(db, out, month=None, full=False, quiet=False):
                     WHEN match = 'yes' THEN 'Match'
                     WHEN score >= {RETAKE_SCORE} THEN 'Mismatch - high score'
                     WHEN score < {RETAKE_SCORE} THEN 'Mismatch - low score'
-                    ELSE 'Mismatch - no score' END AS "Result",
+                    ELSE 'Mismatch - no score' END'''
+
+# The lists written only with --all-reports: each is a filter or a total of details_<month>.csv,
+# or (reading_attempts) a copy of the database table of earlier attempts.
+EXTRA_REPORTS = ('summary.csv', 'comparison.csv', 'mismatches.csv', 'missing.csv', 'duplicates.csv',
+                 'mismatches_high_score.csv', 'mismatches_low_score.csv', 'no_digits.csv', 'no_meter.csv',
+                 'blank.csv', 'no_saved_reading.csv', 'errors.csv', 'reading_attempts.csv', 'retry_failures.csv')
+
+
+def export_reports(db, out, month=None, quiet=False, everything=False):
+    """all_readings_<month>.csv and details_<month>.csv, one pair per month (a whole year
+    would not open in Excel): every photo, details with every column and the result in
+    words. everything also writes the EXTRA_REPORTS lists; without it, those left in out
+    by an earlier run are removed, so an old list is never taken for a current one.
+    Returns the summary, one dict per month, and prints it unless quiet."""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    months = [month] if month else [m for (m,) in db.execute('SELECT DISTINCT month FROM readings ORDER BY month')]
+    for each in months:
+        each = each or 'unknown'
+        write_csv(out / f'all_readings_{each}.csv', db.execute(*list_query('all', each)))
+        # Every column of every photo, the model's whole answer and the image checks included.
+        write_csv(out / f'details_{each}.csv', db.execute(
+            f'SELECT *, {_RESULT} AS result FROM readings WHERE month IS ? ORDER BY picture_name',
+            [_month(each)]))
+    if everything:
+        write_extra_reports(db, out, month)
+    else:
+        for name in EXTRA_REPORTS:
+            (out / name).unlink(missing_ok=True)
+    cursor = summary(db, month)
+    columns = [column[0] for column in cursor.description]
+    totals = [dict(zip(columns, row)) for row in cursor]
+    if not quiet:
+        print(f'{out}: ' + ', '.join(f'all_readings_{m or "unknown"}.csv, details_{m or "unknown"}.csv' for m in months)
+              + (', ' + ', '.join(EXTRA_REPORTS[:-1]) if everything else ''))
+        for line in summary_lines(totals):
+            print('  ' + line)
+    return totals
+
+
+def summary_lines(totals):
+    """The summary as log lines, one per month."""
+    return [f"{t['month']}: {t['photos']} photos, {t['read_correctly']} read correctly ({t['percent_correct']}%), "
+            f"{t['mismatch']} mismatch ({t['mismatch_high_score']} high score, {t['mismatch_low_score']} low score), "
+            f"{t['missing_reading']} no reading, {t['no_meter']} no meter, {t['blank']} blank, "
+            f"{t['no_saved_reading']} no saved reading, {t['failed']} failed, "
+            f"{t['seconds_per_photo']} s per photo" for t in totals]
+
+
+def write_extra_reports(db, out, month=None):
+    write_csv(out / 'summary.csv', summary(db, month))
+    comparison_filter = 'WHERE month IS ?' if month else ''
+    write_csv(out / 'comparison.csv', db.execute(f'''
+        SELECT picture_name AS "File name", saved_reading AS "Saved by system",
+               extracted_whole AS "Extracted by AI", extracted_reading AS "Raw digits",
+               extracted_decimals AS "Digits stripped", score AS "Score",
+               {_RESULT} AS "Result",
                model AS "AI model", error AS "Error",
                CASE WHEN retake = 1 THEN 'yes' WHEN retake = 0 THEN 'no' END AS "Rejected",
                reject_reason AS "Why rejected", device_type AS "Meter type",
@@ -874,8 +948,8 @@ def export_reports(db, out, month=None, full=False, quiet=False):
                operator AS "Operator", latitude AS "Latitude", longitude AS "Longitude"
         FROM readings {comparison_filter} ORDER BY month, picture_name
     ''', [_month(month)] if month else []))
-    counts = {kind: write_csv(out / f'{kind}.csv', db.execute(*list_query(kind, month)))
-              for kind in ('mismatches', 'missing', 'duplicates')}
+    for kind in ('mismatches', 'missing', 'duplicates'):
+        write_csv(out / f'{kind}.csv', db.execute(*list_query(kind, month)))
     mismatch_sql, mismatch_params = list_query('mismatches', month)
     for label, condition in (('high_score', 'score >= ?'), ('low_score', 'score < ?')):
         write_csv(out / f'mismatches_{label}.csv', db.execute(
@@ -889,28 +963,12 @@ def export_reports(db, out, month=None, full=False, quiet=False):
     write_csv(out / 'reading_attempts.csv', db.execute(
         'SELECT * FROM reading_attempts' + (' WHERE month IS ?' if month else '') +
         ' ORDER BY read_at, picture_name', [_month(month)] if month else []))
-    if full:  # one file per month: a whole year would not open in Excel
-        months = [month] if month else [m for (m,) in db.execute(
-            'SELECT DISTINCT month FROM readings ORDER BY month')]
-        for month in months:
-            month = month or 'unknown'
-            write_csv(out / f'all_readings_{month}.csv', db.execute(*list_query('all', month)))
-            # Every column of every photo, the model's whole answer and the image checks included.
-            write_csv(out / f'details_{month}.csv', db.execute(
-                'SELECT * FROM readings WHERE month IS ? ORDER BY picture_name',
-                [None if month == 'unknown' else _month(month)]))
-
-    if not quiet:
-        print(f'{out}: summary.csv, ' + ', '.join(f'{kind}.csv ({rows})' for kind, rows in counts.items())
-              + (', all_readings_<month>.csv' if full else '') + ', reading_attempts.csv')
-        for line in (out / 'summary.csv').read_text(encoding='utf-8-sig').splitlines():
-            print('  ' + line.replace(',', '\t'))
 
 
 def command_report(args):
     db = connect(args.db)
     try:
-        export_reports(db, args.out, args.month, args.full)
+        export_reports(db, args.out, args.month, everything=args.all_reports)
     finally:
         db.close()
 
@@ -979,6 +1037,9 @@ def main():
     read.add_argument('--log', help='log file for everything the run prints, each line timestamped '
                                     '(default: <word-dir>/logs/read_<date>_<time>.log)')
     read.add_argument('--no-log', action='store_true', help='print to the terminal only, write no log file')
+    read.add_argument('--all-reports', action='store_true',
+                      help='besides all_readings_<month>.csv and details_<month>.csv, also write summary, comparison, '
+                           'the mismatch and missing lists, duplicates, reading_attempts and retry_failures')
     read.set_defaults(run=command_read)
 
     imported = commands.add_parser('import-log', help='store the results of a saved `read --verbose` output, '
@@ -993,7 +1054,9 @@ def main():
     report = commands.add_parser('report', help='write the CSV reports')
     report.add_argument('--out', default='reports/audit')
     report.add_argument('--month', help='only this YYYY-MM')
-    report.add_argument('--full', action='store_true', help='also export every row, one CSV per month')
+    report.add_argument('--full', action='store_true', help='no effect: every row is always exported (kept for older commands)')
+    report.add_argument('--all-reports', action='store_true',
+                        help='also write summary, comparison, the mismatch and missing lists, duplicates and reading_attempts')
     report.set_defaults(run=command_report)
 
     args = parser.parse_args()
