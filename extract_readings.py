@@ -96,6 +96,11 @@ class _Server:
 SERVERS = [_Server(url) for url in OCR_URLS]
 
 
+# Photos read at once when the server reports its slots: at most this many, and at most
+# WORKERS_PER_SLOT per slot. Production value.
+IMAGE_WORKERS = int(os.environ.get('FOTOMATES_IMAGE_WORKERS', '24'))
+
+
 class Backend:
     """One model to read with: its name on the server, the server(s) serving it,
     how many photos to send it at once, and the time one photo may take there,
@@ -107,7 +112,7 @@ class Backend:
                  workers: int | None = None):
         self.key, self.label, self.model, self.servers = key, label, model, servers
         self.fixed_workers = workers is not None
-        self.workers = workers or int(os.environ.get('FOTOMATES_IMAGE_WORKERS', '1'))
+        self.workers = workers or IMAGE_WORKERS
 
 
 def _backends() -> dict:
@@ -159,7 +164,8 @@ _TURN = itertools.count()  # which server of a model takes the next photo
 
 
 
-_SERVER_SLOTS = int(os.environ.get('FOTOMATES_SERVER_SLOTS', '0'))
+# The slot count assumed when a server's /slots endpoint does not answer. Production value.
+_SERVER_SLOTS = int(os.environ.get('FOTOMATES_SERVER_SLOTS', '32'))
 WORKERS_PER_SLOT = int(os.environ.get('FOTOMATES_WORKERS_PER_SLOT', '2'))
 
 
@@ -174,13 +180,29 @@ def server_slots(servers: list | None = None) -> int | None:
     return sum(counts) or None
 
 
+def image_workers(choice: Backend, slots: int | None = None) -> int:
+    """How many photos to read at once with a model choice: its own worker count when it
+    has one or no slot count is known, otherwise WORKERS_PER_SLOT per slot, at most IMAGE_WORKERS."""
+    if choice.fixed_workers or not slots:
+        return choice.workers
+    return min(IMAGE_WORKERS, slots * WORKERS_PER_SLOT)
+
+
 # The photo file types the model server reads as they are.
 PHOTO_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".bmp": "image/bmp"}
 
 
+class PhotoFileError(OSError):
+    """The photo's file could not be read (the share gone, a file not there): raised
+    before any model request, so the photo itself was never judged."""
+
+
 @functools.lru_cache(maxsize=512)
 def photo_bytes(path: Path) -> bytes:
-    return path.read_bytes()
+    try:
+        return path.read_bytes()
+    except OSError as error:
+        raise PhotoFileError(error.errno, f'{type(error).__name__}: {error}', str(path)) from error
 
 
 def photo_data_url(path: Path) -> str:
@@ -245,19 +267,6 @@ def extract_device_type(text: str) -> str | None:
     return 'digital' if types[-1].upper() == 'DIGITAL' else 'mechanical'
 
 
-def extract_window_decimals(text: str) -> int | None:
-    lines = re.findall(r'^WINDOWS:[ \t]*([^\n]*)', text, re.IGNORECASE | re.MULTILINE)
-    windows = lines[-1].lower().split() if lines else []
-    digits = _reading_digits(text)
-    if not digits or len(windows) != len(digits):
-        return None
-    colours = [word.split('-')[0] for word in windows]
-    colour = max(set(colours), key=colours.count)  # the integer wheels' colour
-    marked = [word.split('-')[0] != colour or 'small' in word.split('-')[1:] for word in windows]
-    decimals = len(marked) - next((i + 1 for i in range(len(marked) - 1, -1, -1) if not marked[i]), 0)
-    return decimals if decimals < len(windows) and not any(marked[:len(marked) - decimals]) else 0
-
-
 def extract_no_meter(text: str) -> bool:
     answers = re.findall(r"READING:[ \t]*\**[ \t]*([^\n*]+)", text or '', re.IGNORECASE)
     return bool(answers) and re.match(r"\s*NO[\s_-]*METER", answers[-1], re.IGNORECASE) is not None
@@ -268,33 +277,41 @@ def extract_blank(text: str) -> bool:
     return bool(answers) and re.match(r"\s*BLANK\b", answers[-1], re.IGNORECASE) is not None
 
 
-def extract_rolling(text: str) -> list[dict]:
+def _cells_digits(text: str) -> str | None:
+    """The digits of the last CELLS line when it is one digit per cell, else None."""
+    cells = re.findall(r'^CELLS:[ \t]*([^\n]*)', text or '', re.IGNORECASE | re.MULTILINE)
+    if cells and re.fullmatch(r'[ \t]*\d(?:[ \t]+\d)*[ \t]*', cells[-1]):
+        return ''.join(cells[-1].split())
+    return None
 
-    if extract_device_type(text) != 'mechanical':
-        return []
-    lines = re.findall(r"ROLLING:[ \t]*\**[ \t]*([^\n*]*)", text, re.IGNORECASE)
-    if not lines or re.fullmatch(r"\s*(NONE|NO|-|N/?A)?\s*\.?\s*", lines[-1], re.IGNORECASE):
-        return []
-    wheels = [dict(position=int(position), lower=int(lower), upper=int(upper))
-              for position, lower, upper in re.findall(r"(\d+)\s*:\s*(\d)\s*[-/]\s*(\d)", lines[-1])]
-    return wheels or [dict(position=None, lower=None, upper=None)]
+
+def _reading_line(text: str) -> str | None:
+    """READING's digits as written (dotted codes dropped, a glued register code still
+    on); "" when it holds anything but digits, None when there is no READING line."""
+    answers = re.findall(r"READING:[ \t]*\**[ \t]*([^\n*]+)", text or '', re.IGNORECASE)
+    if not answers:
+        return None
+    reading = ""
+    for token in answers[-1].split():
+        token = _DOTTED_CODE.sub("", token).strip(".,")
+        if not re.search(r"\d", token):  # a unit such as kWh, or UNREADABLE
+            continue
+        if not re.fullmatch(r"[0-9]+(?:[.,][0-9]+)?", token):
+            return ""
+        reading += re.sub(r"[.,]", "", token)
+    return reading
 
 
 def _reading_digits(text: str) -> str:
-   
-    answers = re.findall(r"READING:[ \t]*\**[ \t]*([^\n*]+)", text, re.IGNORECASE)
-    if answers:
-        reading = ""
-        for token in answers[-1].split():
-            token = _DOTTED_CODE.sub("", token).strip(".,")
-            if not re.search(r"\d", token):  # a unit such as kWh, or UNREADABLE
-                continue
-            if not re.fullmatch(r"[0-9]+(?:[.,][0-9]+)?", token):
-                return ""
-            reading += re.sub(r"[.,]", "", token)
+    reading = _reading_line(text)
+    if reading is not None:
         codes = re.findall(r"CODE:[ \t]*\**[ \t]*([^\n*]*)", text, re.IGNORECASE)
-        
         if extract_device_type(text) != 'mechanical':
+            # A digital display read cell by cell (CELLS, prompt v2): READING only copies
+            # those digits, so where the two differ the cells are kept.
+            cells = _cells_digits(text)
+            if reading and cells and cells != reading:
+                reading = cells
             reading = _strip_code(reading, codes[-1] if codes else "")
     else:
         runs = []
@@ -307,10 +324,9 @@ def _reading_digits(text: str) -> str:
     if not re.fullmatch(r"[0-9]+", reading):
         return ""
     if extract_device_type(text) == 'mechanical':
-        cells = re.findall(r'^CELLS:[ \t]*([^\n]*)', text, re.IGNORECASE | re.MULTILINE)
-        if cells and re.fullmatch(r'[ \t]*\d(?:[ \t]+\d)*[ \t]*', cells[-1]):
-            if ''.join(cells[-1].split()) != reading:
-                return ""
+        cells = _cells_digits(text)
+        if cells is not None and cells != reading:
+            return ""  # a mechanical READING that is not its wheels is not trusted
     if _digit_count(reading) > _MAX_READING_DIGITS:
         return ""
     return reading
@@ -319,13 +335,7 @@ def extract_decimal_digits(text: str) -> int | None:
     if extract_device_type(text) != 'mechanical':
         return None
     answers = re.findall(r'^DECIMALS:[ \t]*(\d+|UNKNOWN)[ \t]*$', text, re.IGNORECASE | re.MULTILINE)
-    windows = extract_window_decimals(text)
-    if windows is not None:
-        count = windows
-    elif not answers or answers[-1].upper() == 'UNKNOWN':
-        count = None
-    else:
-        count = int(answers[-1])
+    count = int(answers[-1]) if answers and answers[-1].isdigit() else None
     digits = _reading_digits(text)
     return count if count is not None and digits and 0 <= count < len(digits) else None
 
@@ -344,7 +354,6 @@ class OcrResult:
     digit_margin: list | None = None         # per digit: its probability minus the runner-up digit's
     digit_runner_up: list | None = None      # per digit: the most likely other digit, or None
     digit_alternatives: list | None = None   # per digit: {digit: probability} of the model's top alternatives
-    rolling: list | None = None              # mechanical wheels caught between two numbers
     device_type: str | None = None           # 'mechanical', 'digital', or None when not said
     decimal_digits: int | None = None        # visually marked fractional wheels; 0 means none
     clear: float | None = None               # the model's probability that the photo is CLEAR, 0..1
@@ -459,27 +468,31 @@ def score_reading(cells: str, per_digit: list | None, decimals: int | None,
 
 def _digit_confidence(choice) -> tuple[float | None, list, list, list, list]:
     """Each digit's probability where the model first read it off the photo: the
-    CELLS line. READING repeats those digits, so there the model is copying and is
-    always near 100% sure. A display with no cells (CELLS: NONE) is first read at
-    READING, and so is any answer whose CELLS do not give the READING's digits."""
+    CELLS line, on every meter (prompt v2; compact writes cells for mechanical
+    counters only). READING repeats those digits, so there the model is copying and
+    is always near 100% sure. An answer without a CELLS row of one digit per cell
+    (CELLS: NONE) is first read at READING."""
     tokens = getattr(getattr(choice, 'logprobs', None), 'content', None) or []
-    reading = _line_digits(tokens, 'READING:')
+    content = getattr(getattr(choice, 'message', None), 'content', None) or ''
+    written = _cells_digits(content)
     cells = _line_digits(tokens, 'CELLS:')
     probabilities, margins, runner_ups, alternatives = (
-        cells if cells[0] and len(cells[0]) == len(reading[0]) else reading)
+        cells if written and len(cells[0]) == len(written) else _line_digits(tokens, 'READING:'))
     return (min(probabilities) if probabilities else None), probabilities, margins, runner_ups, alternatives
 
 
 def _clear_probability(choice) -> float | None:
-    """The probability the model gave QUALITY: CLEAR, from the first word it wrote
-    on that line and its alternatives; None when it wrote no QUALITY line."""
+    """How clear the model judged the photo, 0..1, from the first word it wrote on the
+    QUALITY line and its alternatives: for CLEAR or POOR (compact), the probability of
+    CLEAR; for a number 0-10 (v2), its expected value over the alternatives, divided
+    by 10 (a 1 followed by a 0 is 10). None when it wrote no QUALITY line."""
     tokens = getattr(getattr(choice, 'logprobs', None), 'content', None) or []
     joined = ''.join(token.token or '' for token in tokens)
     marker = joined.upper().rfind('QUALITY:')
     if marker < 0:
         return None
     begin, offset = marker + len('QUALITY:'), 0
-    for token in tokens:
+    for index, token in enumerate(tokens):
         piece = token.token or ''
         end = offset + len(piece)
         word = piece[max(0, begin - offset):].strip().upper()
@@ -489,11 +502,34 @@ def _clear_probability(choice) -> float | None:
                 key = alt.token.strip().upper()
                 if alt.logprob is not None and key:
                     options[key] = max(options.get(key, 0.0), math.exp(alt.logprob))
+            if word[:1].isdigit():
+                return _expected_quality(word, options, tokens[index + 1] if index + 1 < len(tokens) else None)
             clear = sum(p for key, p in options.items() if key[:1] == 'C')
             poor = sum(p for key, p in options.items() if key[:1] == 'P')
             return clear / (clear + poor) if clear + poor else None
         offset = end
     return None
+
+
+def _expected_quality(word, options, following):
+    """The expected QUALITY 0-10, divided by 10, from the first token's alternatives.
+    Digits are often one token each, so a written 1 is 10 with the chance that the
+    next token is 0."""
+    ten = 0.0
+    if word == '1' and following is not None and following.logprob is not None:
+        nexts = {(following.token or '').strip(): math.exp(following.logprob)}
+        for alt in getattr(following, 'top_logprobs', None) or []:
+            if alt.logprob is not None:
+                key = alt.token.strip()
+                nexts[key] = max(nexts.get(key, 0.0), math.exp(alt.logprob))
+        ten = nexts.get('0', 0.0) / (sum(nexts.values()) or 1.0)
+    total = weight = 0.0
+    for key, p in options.items():
+        if not key.isdigit():
+            continue
+        value = 1 + 9 * ten if key == '1' else min(int(key), 10)
+        total, weight = total + p * value, weight + p
+    return total / weight / 10 if weight else None
 
 
 def _line_digits(tokens, label: str) -> tuple[list, list, list, list]:
@@ -553,136 +589,6 @@ def _failure_reason(error: Exception) -> str:
         chain.append(f'{type(current).__name__}: {message[:300]}')
         current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
     return ' <- '.join(chain)
-
-
-_SYSTEM_PROMPT = (
-    "You transcribe meter readings from photographs. Preserve every visible digit cell, "
-    "especially the first and last mechanical wheels. Never drop a wheel as a decimal. "
-    "A last wheel set apart by its own coloured or white box, frame, or window, or "
-    "labelled 0.1 above it, is a fractional wheel: keep it and count it in DECIMALS. "
-    "For a mechanical counter, read only the printed digits on the number wheels inside "
-    "the counter window; never read handwritten, painted, or sticker numbers. "
-    "For a mechanical counter, first transcribe each physical wheel separately, "
-    "then concatenate those same digits into READING without losing the final wheel. "
-    "Reply with exactly these seven "
-    "lines and nothing else, no explanation:\n"
-    "CELLS: <MECHANICAL: each wheel digit from left to right separated by spaces; DIGITAL: NONE>\n"
-    "WINDOWS: <MECHANICAL: each wheel's window colour from left to right, with -box when "
-    "it has its own frame; DIGITAL: NONE>\n"
-    "READING: <every digit cell of the main row of large digits, UNREADABLE, NO METER, or BLANK>\n"
-    "TYPE: <DIGITAL for an LCD or LED display, MECHANICAL for a counter of turning number wheels>\n"
-    "ROLLING: <only for MECHANICAL: wheels caught turning between two numbers, as "
-    "position:lower-upper; NONE for DIGITAL or when no wheel is turning>\n"
-    "DECIMALS: <MECHANICAL: visually marked fractional wheel count, 0 if none; "
-    "UNKNOWN for DIGITAL or if fractional markings cannot be determined>\n"
-    "QUALITY: <CLEAR or POOR>")
-_USER_PROMPT = (
-    "Read the consumption register on this meter: the main row of large digits on the display.\n"
-    "First find that row: the longest line of the largest digits, side by side. Then read "
-    "every digit cell in it from the first to the very last, one digit per cell, including "
-    "leading zeros and the last cell or two at the right end, even when that cell is boxed, "
-    "in another colour, slightly smaller, faint, or under glare. Count the cells and make "
-    "sure you wrote one digit for each: never skip a cell and never write a digit twice.\n"
-    "Many displays also show a register code: a short group of small digits, usually two or "
-    "three numbers joined by dots, set apart at the left or top edge of the display and smaller "
-    "than the main row. Its numbers can be anything: recognise it by its size, its dots and its "
-    "place, never by its value. Never write it in READING, even when it sits on the same line "
-    "as the main row or its dots are hard to see. The main row's own leading zeros and first "
-    "digits are never a code: they are as large as the rest of the row, so read them as part of it.\n"
-    "Leave out every digit that is not in that row: the register code, a single small 1 or "
-    "index before the row, a tariff or register number, units, the meter serial, the model code, the barcode, the "
-    "year and every number printed outside the display. Never add a digit you cannot see.\n"
-    "On a MECHANICAL counter the reading is only the printed digits on the turning number "
-    "wheels seen through the counter window. Ignore every handwritten number: digits "
-    "written in pen, marker, chalk, or paint on the meter face, the glass, the cover, a "
-    "label, or a sticker, even when they are larger, darker, or closer to the camera than "
-    "the wheels, and even when they look like a reading. Wheel digits are all the same "
-    "printed font and size, evenly spaced, each in its own wheel slot; a number that is "
-    "not inside those slots is never part of READING.\n"
-    "Read each digit from its own strokes or segments, not from what you expect: 7 has no "
-    "lower-left or bottom segment while 9 has both a top-left segment and a bottom; 8 has a "
-    "middle segment that 0 lacks; 6 has a lower-left segment that 5 lacks; 1 is only one "
-    "vertical stroke on the right.\n"
-    "5 and 9 are easily confused: check the upper right. A 9 has an upper-right segment "
-    "or stroke that closes its top into a loop; a 5 has none there, its top is a flat bar "
-    "with a stroke down the left side only, so its upper half is open on the right. On a "
-    "printed wheel, 5 has a straight top bar and a sharp corner at the upper left, 9 a "
-    "round closed loop on top. Write 9 only when you see that closed upper loop; when the "
-    "upper right is open, it is a 5, even if the lower half looks round. In the same way "
-    "a 6 closes its lower half into a loop on the left, while a 5 is open at the lower "
-    "left.\n"
-    "Give the digits as one unbroken string with no dot and no comma. When the row cannot "
-    "be read, write UNREADABLE; when the photo shows no meter at all, write NO METER.\n"
-    "Write BLANK when the photo shows nothing recognisable: all or nearly all black, white, "
-    "grey or one colour, the lens covered, or so blurred that no object can be made out. "
-    "Write NO METER when the photo shows something, but no meter register: no meter LCD or "
-    "LED display and no counter window of number wheels. Numbers alone are not a meter: "
-    "numbers on a sticker, label, paper, document, nameplate, serial plate, barcode, phone "
-    "screen, wall, door, box or cable are NO METER, even when they look like a reading. "
-    "Never write digits that are not on a meter's register. When a meter is visible but its "
-    "display is off, dark or cannot be read, write UNREADABLE, not NO METER and not BLANK.\n"
-    "TYPE says what shows the register: DIGITAL for an LCD or LED display of segment "
-    "digits, MECHANICAL for a counter of printed number wheels behind a window.\n"
-    "For a MECHANICAL counter, locate every wheel aperture from the left edge to the "
-    "right edge before reading. Transcribe one digit per wheel, including a partially "
-    "visible or turning final wheel: six visible wheels require six digits, not five. "
-    "Do not mistake the final wheel for a unit, serial digit, or decimal to omit. "
-    "Before deciding DECIMALS, look at the window of every wheel and describe it on the "
-    "WINDOWS line, one word per wheel from left to right, in the same order as CELLS: "
-    "dark, white, red, orange, yellow, or other for the window's background colour, "
-    "followed by -box when that wheel has a frame or border of its own, e.g. "
-    "WINDOWS: dark dark dark dark dark white-box. Then DECIMALS is the number of "
-    "wheels at the right end that the WINDOWS line, a separator, or a 0.1 scale sets "
-    "apart from the wheels before them. "
-    "A row of wheels whose windows all look alike, with no separator and no 0.1 scale, "
-    "is an integer register: DECIMALS: 0. Neither position at the right end nor the "
-    "number of digits in an expected reading is evidence of decimals; a wheel is not "
-    "fractional merely because it is last. "
-    "Wheels at the right end are a marked fractional section when they are set apart "
-    "from the integer wheels by any of: a different background or window colour (red, "
-    "pink, magenta, orange, yellow, or white/light where the other wheels are dark, or "
-    "dark where they are light); a box, frame, or border of their own; a decimal point "
-    "or comma before them; or a scale printed above the wheels that labels them 0.1, "
-    "x0.1, or 1/10. This holds even when the digit is the same height; glare may make "
-    "a coloured panel look pale or white. Include those wheels in READING and count "
-    "them in DECIMALS. Example: black wheels 0 4 7 2 9 3 followed by one red wheel 6 gives "
-    "CELLS: 0 4 7 2 9 3 6, READING: 0472936, DECIMALS: 1. White digits on a dark band "
-    "0 4 2 9 6 followed by a 7 in a white box of its own give CELLS: 0 4 2 9 6 7, "
-    "READING: 042967, DECIMALS: 1. Black wheels "
-    "3 8 1 2 5 6 with no separator or marked fractional section give CELLS: "
-    "3 8 1 2 5 6, READING: 381256, DECIMALS: 0. "
-    "Keep fractional wheels in READING too; DECIMALS only describes them. If markings "
-    "are unclear write DECIMALS: UNKNOWN, never invent a separator. For DIGITAL write "
-    "DECIMALS: UNKNOWN.\n"
-    "Only on a MECHANICAL counter can a wheel be caught turning, showing parts of two "
-    "numbers at once. Write the lower of the two in READING (9 when it turns from 9 to 0), "
-    "and report every such wheel on the ROLLING line as its position in READING counted "
-    "from the left, then the two numbers, e.g. 6:6-7. For a DIGITAL display always write "
-    "ROLLING: NONE.\n"
-    "When the counter is too blurred, dim, or washed out to read every wheel, write "
-    "UNREADABLE instead of guessing digits.\n"
-    "Before replying, check the first and final wheel and verify that the READING "
-    "digit count equals the visible wheel count. Never infer a missing digit from a "
-    "stored reading, and never omit a visible wheel to make the length fit.\n"
-    "Copy every digit from CELLS into READING in order; do not shorten it. "
-    "A partially visible bottom or top of the final wheel still belongs to that "
-    "wheel. If a required wheel cannot be read, use UNREADABLE rather than "
-    "returning a shorter reading.\n"
-    "Last, judge the photo for QUALITY: could a person check every digit you wrote from "
-    "this photo alone, without guessing? CLEAR when every digit of the row is sharp and "
-    "fully visible. POOR when any digit is blurred, faint, washed out, under glare or a "
-    "reflection, cut off, too small to make out its strokes, or seen through a scratched "
-    "or misted cover; when the photo is of a screen or of another photo; or when the "
-    "display shows a test pattern (all segments lit, or every cell the same) instead of "
-    "the reading. When in doubt: POOR.\n"
-    "Reply with exactly seven lines:\n"
-    "CELLS: mechanical wheel digits separated by spaces, or NONE for DIGITAL\n"
-    "WINDOWS: one window word per wheel, as described above, or NONE for DIGITAL\n"
-    "READING: every digit cell of the main row, UNREADABLE, NO METER, or BLANK\n"
-    "TYPE: DIGITAL or MECHANICAL\n"
-    "ROLLING: position:lower-upper for each turning wheel, comma separated, or NONE\n"
-    "DECIMALS: visually marked fractional wheel count, 0 when none, or UNKNOWN\n"
-    "QUALITY: CLEAR or POOR.")
 
 
 _COMPACT_SYSTEM_PROMPT = (
@@ -793,11 +699,200 @@ _COMPACT_USER_PROMPT = (
     "too small to make out its strokes, or seen through a scratched or misted cover; the "
     "photo is of a screen or of another photo; or the display shows a test pattern (all "
     "segments lit, or every cell the same) instead of the reading. When in doubt: POOR.")
-if os.environ.get('FOTOMATES_PROMPT', 'compact') == 'compact':
-    _SYSTEM_PROMPT, _USER_PROMPT = _COMPACT_SYSTEM_PROMPT, _COMPACT_USER_PROMPT
+# v2: five lines (TYPE, CELLS, READING, DECIMALS, QUALITY 0-10): CELLS for every meter,
+# no WINDOWS or ROLLING, and the DIGIT SHAPES cut to the pairs that are confused.
+_V2_SYSTEM_PROMPT = (
+    "You read electricity meter registers from photos. Answer with exactly these five "
+    "lines and nothing else:\n"
+    "TYPE: DIGITAL or MECHANICAL\n"
+    "CELLS: one digit per cell of the main row, left to right, space separated; NONE when "
+    "there is no row to read\n"
+    "READING: the CELLS digits as one string with no space, dot or comma, or UNREADABLE, "
+    "or NO METER, or BLANK\n"
+    "DECIMALS: on a mechanical counter, the number of wheels at the right end with a "
+    "smaller digit or a box of another colour, 0 if none; on a digital display, UNKNOWN\n"
+    "QUALITY: <0-10>: 10 when every digit could be checked by a person from this photo, "
+    "0 when none")
+_V2_USER_PROMPT = (
+    "TASK\n"
+    "Read the consumption register: the main row of the largest digits on the display.\n"
+    "\n"
+    "WHAT TO READ\n"
+    "- Every digit cell of that row, first to last, one digit per cell, in CELLS: leading "
+    "zeros, and the last cell or two even when boxed, coloured, smaller, faint or under "
+    "glare. Never skip or repeat a cell: CELLS has as many digits as the row has cells, "
+    "and READING copies them.\n"
+    "- On a mechanical counter: only the printed digits on the wheels inside the counter "
+    "window, including a partly visible or turning last wheel. A wheel caught between two "
+    "numbers: write the lower one (9 when it turns from 9 to 0).\n"
+    "\n"
+    "WHAT TO IGNORE\n"
+    "- The register code: a short group of smaller digits, often joined by dots, at the "
+    "left or top edge of the display. Recognise it by size, dots and place, never by "
+    "value. The row's own leading zeros are as large as the row and belong to it.\n"
+    "- A small 1 or index before the row, tariff or register numbers, units, serial, model "
+    "code, barcode, year and anything printed outside the display.\n"
+    "- Handwritten, painted or sticker numbers anywhere (face, glass, cover, label), even "
+    "when larger, darker or closer to the camera than the wheels.\n"
+    "\n"
+    "DIGIT SHAPES (read each digit from its own strokes, not from what you expect)\n"
+    "- A digit has up to 7 strokes: top, upper-left, upper-right, middle, lower-left, "
+    "lower-right, bottom. On an LCD, faint unlit segments do not count; a faint but "
+    "present stroke still counts, and glare or a reflection never adds one.\n"
+    "- 5 or 6: a lower-left stroke closing the lower loop makes it 6. Write 5 only when "
+    "the lower left is clearly empty.\n"
+    "- 1 or 7: a top bar across the top of the cell makes it 7, however short or faint. "
+    "Write 1 only when the top of the cell is empty.\n"
+    "- 0 or 8: 8 has a middle stroke; 0 has none.\n"
+    "- 6 or 8: 8 closes its upper loop on the right; 6 is open at the upper right.\n"
+    "- 2 or 7: 2 has a middle stroke and a bottom bar; 7 has neither.\n"
+    "- 5 or 3: 3 has the upper-right stroke and no upper-left; 5 has the upper-left and "
+    "no upper-right.\n"
+    "- 5 or 9: 9 has the upper-right stroke, closing its upper loop; 5 is open at the "
+    "upper right.\n"
+    "- Printed wheels: a 1 has a flag and a base; a 7 has a straight top bar.\n"
+    "- Printed wheels: 6 and 9 are closed loops; 5 and 3 are open.\n"
+    "\n"
+    "DECIMALS (mechanical counters)\n"
+    "- A wheel at the right end is a decimal only when its digit is smaller than the "
+    "other wheels' digits, or it sits in a box of another colour than the wheels before "
+    "it (red, pink, orange, yellow, or white where the others are dark; glare can make "
+    "red look pale). Nothing else makes a decimal: not a frame of the same colour, not a "
+    "dot or comma, not a printed 0.1 label, not being the last wheel. Otherwise "
+    "DECIMALS: 0. Keep decimal wheels in CELLS and READING.\n"
+    "- Examples: six dark wheels then one wheel in a red box: DECIMALS: 1. Five wheels "
+    "then a smaller digit of the same colour: DECIMALS: 1. Six wheels all the same size "
+    "and colour: DECIMALS: 0.\n"
+    "\n"
+    "PHOTOS WITHOUT A METER\n"
+    "- BLANK: the photo shows nothing recognisable: all or nearly all black, white, grey "
+    "or one colour, the lens covered, or so blurred that no object can be made out.\n"
+    "- NO METER: the photo shows something, but no meter register: no meter LCD or LED "
+    "display and no counter window of number wheels. Numbers alone are not a meter: "
+    "numbers on a sticker, label, paper, document, nameplate, serial plate, barcode, "
+    "phone screen, wall, door, box or cable mean no meter, even when they look like a "
+    "reading. Never write digits that are not on a meter's register.\n"
+    "- A meter is visible but its display is off, dark or cannot be read: UNREADABLE.\n"
+    "\n"
+    "WHEN UNSURE\n"
+    "- Too blurred, dim or washed out to read every cell: UNREADABLE. Never guess a digit "
+    "and never shorten the reading to fit a length you expect.\n"
+    "\n"
+    "QUALITY (always, last)\n"
+    "- After reading, judge the photo: how many of the digits you wrote could a person "
+    "check from this photo alone, without guessing? 10: every digit is sharp and fully "
+    "visible. Lower it for each digit that is blurred, faint, washed out, under glare or a "
+    "reflection, cut off, too small to make out its strokes, or seen through a scratched "
+    "or misted cover. 0: none can be checked, the photo is of a screen or of another "
+    "photo, or the display shows a test pattern (all segments lit, or every cell the "
+    "same) instead of the reading.")
+
+# Which prompt reads the photos: v2 (the default since the 4 Nov test: as accurate as compact, ~30% faster) or compact. Anything else is an error,
+# so a typo cannot select another prompt silently.
+PROMPTS = {'compact': (_COMPACT_SYSTEM_PROMPT, _COMPACT_USER_PROMPT),
+           'v2': (_V2_SYSTEM_PROMPT, _V2_USER_PROMPT)}
+PROMPT = os.environ.get('FOTOMATES_PROMPT', 'v2').strip().lower()
+if PROMPT not in PROMPTS:
+    raise ValueError(f"FOTOMATES_PROMPT must be 'compact' or 'v2', not {PROMPT!r}")
+_SYSTEM_PROMPT, _USER_PROMPT = PROMPTS[PROMPT]
+
+# How an unsure photo is read the second time: enlarge (the whole frame, 3x; the default)
+# or crop (cut to the box the first read gives around the display, then enlarged).
+REREAD_MODE = os.environ.get('FOTOMATES_REREAD_MODE', 'enlarge').strip().lower()
+if REREAD_MODE not in ('enlarge', 'crop'):
+    raise ValueError(f"FOTOMATES_REREAD_MODE must be 'enlarge' or 'crop', not {REREAD_MODE!r}")
+# The crop: this share of the box's longer side added on every side, then enlarged so it is
+# CROP_WIDTH px wide (its shorter side never below FOTOMATES_MIN_SIDE).
+CROP_MARGIN = float(os.environ.get('FOTOMATES_CROP_MARGIN', '0.25'))
+CROP_WIDTH = int(os.environ.get('FOTOMATES_CROP_WIDTH', '650'))
+# A box is used only when it looks like a display: its share of the photo's width and
+# height, and its own width / height (in pixels). Width up to 100%: a display can fill it.
+BOX_WIDTH, BOX_HEIGHT, BOX_ASPECT = (0.15, 1.0), (0.04, 0.60), (1.2, 8.0)
+_BOX_LINE = ("BOX: x1 y1 x2 y2: the box around the register display or counter window, every "
+             "digit of the row inside it, as numbers from 0 to 1000 of the photo (x from the left "
+             "edge, y from the top edge); NONE when there is none\n")
+if REREAD_MODE == 'crop':  # the first read also says where the display is
+    _SYSTEM_PROMPT = (_SYSTEM_PROMPT.replace('exactly these seven lines', 'exactly these eight lines')
+                      .replace('exactly these five lines', 'exactly these six lines'))
+    _at = _SYSTEM_PROMPT.rindex('QUALITY:')
+    _SYSTEM_PROMPT = _SYSTEM_PROMPT[:_at] + _BOX_LINE + _SYSTEM_PROMPT[_at:]
 
 
-def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: float = 1.0) -> OcrResult:
+# Crop first (the default): every photo is first read cut to its display, the box asked in
+# a request of its own; FOTOMATES_CROP_FIRST=0 reads the whole photo first, as before.
+CROP_FIRST = os.environ.get('FOTOMATES_CROP_FIRST', '1').strip() not in ('0', 'false', 'no', 'off', '')
+BOX_PROMPT = ('Locate the meter\'s register display: the LCD/LED screen or the window of number wheels that '
+              'shows the consumption. Answer only with JSON: {"bbox_2d": [x1, y1, x2, y2]}')
+
+
+def parse_box(text):
+    """The four numbers of {"bbox_2d": [...]}, or of the first four numbers written; None if fewer."""
+    try:
+        data = json.loads(re.search(r'\{.*\}', text or '', re.S)[0])
+        box = data.get('bbox_2d') if isinstance(data, dict) else None
+        if isinstance(box, list) and len(box) >= 4 and isinstance(box[0], list):
+            box = box[0]  # [[x1, y1, x2, y2]]
+        if isinstance(box, list) and len(box) >= 4:
+            return [float(v) for v in box[:4]]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    numbers = [float(n) for n in re.findall(r'-?\d+(?:\.\d+)?', text or '')]
+    return numbers[:4] if len(numbers) >= 4 else None
+
+
+def find_box(image_path: Path, model: str | None = None) -> dict:
+    """Ask the model, in a request of its own, where the photo's display is: the photo as the
+    first read sends it (shorter side FOTOMATES_MIN_SIDE). Returns box (0-1000, None when
+    there is none or it does not look like a display), why (when not), answer and seconds."""
+    started = time.monotonic()
+    image = decode_image(Path(image_path))
+    height, width = image.shape[:2]
+    scale = max(1.0, _MIN_SIDE / min(height, width))
+    sent = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale > 1 else image
+    choice = backend(model)
+    servers = choice.servers
+    message = complete(server=servers[next(_TURN) % len(servers)], model=choice.model, temperature=0,
+                       max_tokens=60, extra_body=dict(NO_THINKING),
+                       messages=[{'role': 'user', 'content': [
+                           {'type': 'image_url', 'image_url': {'url': png_data_url(sent)}},
+                           {'type': 'text', 'text': BOX_PROMPT}]}]).choices[0].message
+    answer = (message.content or '').strip()
+    box = parse_box(answer)
+    rect, why = crop_rect(box, width, height) if box else (None, 'no box')
+    return dict(box=tuple(box) if rect else None, why=why, answer=answer, seconds=time.monotonic() - started)
+
+
+def extract_box(text: str) -> tuple | None:
+    """The four numbers of the last BOX line (0-1000 of the photo), or None."""
+    lines = re.findall(r'^BOX:[ \t]*([^\n]*)', text or '', re.IGNORECASE | re.MULTILINE)
+    numbers = re.findall(r'\d+(?:\.\d+)?', lines[-1]) if lines else []
+    return tuple(float(n) for n in numbers[:4]) if len(numbers) >= 4 else None
+
+
+def crop_rect(box, width: int, height: int):
+    """The pixels (x1, y1, x2, y2) of the photo to cut for box (0-1000), with CROP_MARGIN
+    and clipped to the photo, and None; or None and why the box is not used."""
+    if box is None:
+        return None, 'no box'
+    x1, y1, x2, y2 = box
+    if not (0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000):
+        return None, 'box outside the photo'
+    share_w, share_h = (x2 - x1) / 1000, (y2 - y1) / 1000
+    aspect = share_w * width / (share_h * height)
+    if not BOX_WIDTH[0] <= share_w <= BOX_WIDTH[1]:
+        return None, f'box width {100 * share_w:.0f}%'
+    if not BOX_HEIGHT[0] <= share_h <= BOX_HEIGHT[1]:
+        return None, f'box height {100 * share_h:.0f}%'
+    if not BOX_ASPECT[0] <= aspect <= BOX_ASPECT[1]:
+        return None, f'box aspect {aspect:.2f}'
+    px1, py1, px2, py2 = x1 / 1000 * width, y1 / 1000 * height, x2 / 1000 * width, y2 / 1000 * height
+    margin = CROP_MARGIN * max(px2 - px1, py2 - py1)
+    return (max(0, int(px1 - margin)), max(0, int(py1 - margin)),
+            min(width, int(round(px2 + margin))), min(height, int(round(py2 + margin)))), None
+
+
+def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: float = 1.0,
+                 crop: bool = False, box=None) -> OcrResult:
     steps = []
     aids = []
     server = []
@@ -835,11 +930,14 @@ def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: flo
 
     try:
         content, choice, report, readings = _read_photo(image_path, timed, aids, server, model_seconds, choice,
-                                                        scale)
+                                                        scale, crop, box)
     except Exception as error:
         reason = _failure_reason(error)
         raise OcrFailure(reason, breakdown(*server, 'FAILED: ' + reason)) from error
     confidence, per_digit, margins, runner_ups, alternatives = _digit_confidence(choice)
+    written, cells_read = _reading_line(content), _cells_digits(content)
+    if extract_device_type(content) == 'digital' and written and cells_read and cells_read != written:
+        print(f'CELLS {cells_read} differ from READING {written}: CELLS kept ({Path(image_path).name})', flush=True)
     # A register code glued to the front of READING (380..., 158...) is cut from the
     # digits by _reading_digits; cut its probabilities too, so each stays with its digit.
     code_confidence = []
@@ -861,7 +959,6 @@ def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: flo
                      sent_png=base64.b64decode(sent.split(',', 1)[1]) if sent else None,
                      confidence=confidence, digit_confidence=per_digit,
                      digit_margin=margins, digit_runner_up=runner_ups, digit_alternatives=alternatives,
-                     rolling=extract_rolling(content),
                      device_type=extract_device_type(content),
                      decimal_digits=extract_decimal_digits(content),
                      clear=_clear_probability(choice), code_confidence=code_confidence,
@@ -869,18 +966,28 @@ def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: flo
 
 
 def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds: list,
-                backend_choice: Backend = DEFAULT_BACKEND, scale: float = 1.0):
+                backend_choice: Backend = DEFAULT_BACKEND, scale: float = 1.0, crop: bool = False, box=None):
     # The photo is decoded to judge it: whether it is too small or needs enhancing.
     report = dict(blur_variance=0.0)
     needs = []
     original = timed('decode image', lambda: decode_image(image_path))
     size = dict(width=int(original.shape[1]), height=int(original.shape[0]))
+    cropped = False
+    if crop:  # the re-read of a crop: cut the box from the original photo, then enlarge it
+        rect, why = crop_rect(box, size['width'], size['height'])
+        if rect:
+            x1, y1, x2, y2 = rect
+            original = original[y1:y2, x1:x2]
+            scale = max(CROP_WIDTH / (x2 - x1), _MIN_SIDE / min(x2 - x1, y2 - y1))
+            cropped = True
+        else:
+            aids.append(f'crop-fallback({why})')  # the whole frame, enlarged by scale, instead
     # A small photo is enlarged until its shorter side reaches _MIN_SIDE: on a
     # 240x400 photo a digit is ~10 px, smaller than one image patch of the model.
     scale = max(scale, _MIN_SIDE / min(original.shape[:2]))
     enlarged = scale > 1.0
-    if _ENHANCE_MODE != 'never' or enlarged:
-        if enlarged:
+    if _ENHANCE_MODE != 'never' or enlarged or cropped:
+        if enlarged or cropped:
             original = timed('enlarge photo', lambda: cv2.resize(original, None, fx=scale, fy=scale,
                                                                  interpolation=cv2.INTER_CUBIC))
         report = timed('assess quality', lambda: assess(original))
@@ -888,10 +995,12 @@ def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds
             needs = ['always']
         elif _ENHANCE_MODE == 'auto':
             needs = [flag for flag in _ENHANCE_WHEN if report.get(flag)]
-    if needs or enlarged:
+    if needs or enlarged or cropped:
         photo = timed('enhance photo', lambda: enhance(original, report)) if needs else original
         encoded = timed('encode png + base64', lambda: png_data_url(photo))
-        if enlarged:
+        if cropped:
+            aids.append(f'crop({scale:.3g}x)')
+        elif enlarged:
             aids.append(f'enlarged({scale:g}x)')
         if needs:
             aids.append('enhanced(' + ','.join(needs) + ')')
@@ -956,9 +1065,12 @@ def warm_up() -> None:
                 print(f'warm-up skipped for {server.url}: {type(error).__name__}: {error}', flush=True)
 
 
-def ocr_image(image_path: Path, model: str | None = None, scale: float = 1.0) -> OcrResult:
-
-    return _request_ocr(Path(image_path), backend(model), scale)
+def ocr_image(image_path: Path, model: str | None = None, scale: float = 1.0,
+              crop: bool = False, box=None) -> OcrResult:
+    """Read a photo. crop: read the box (0-1000, from the first read's BOX line) cut from
+    the photo; when the box is missing or does not look like a display, the whole photo
+    enlarged by scale, labelled crop-fallback."""
+    return _request_ocr(Path(image_path), backend(model), scale, crop, box)
 
 
 

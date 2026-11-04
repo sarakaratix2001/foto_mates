@@ -29,7 +29,7 @@ from audit_readings import (AUDIT_DB, LIST_KINDS, connect as audit_connect, exce
 from evaluation import LABELS as EVALUATION_LABELS, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, OCR_MODEL, PHOTO_TYPES, QUALITY_DIGIT, QUALITY_SCORE,
                               RETAKE_SCORE, _reading_digits, photo_retake_reason, backend as model_backend, extract_blank, extract_no_meter, score_reading,
-                              WORKERS_PER_SLOT, low_score_reasons, ocr_image, quality_reasons,
+                              image_workers as workers_for, low_score_reasons, ocr_image, quality_reasons,
                               server_slots, warm_up)
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -43,7 +43,6 @@ ALLOWED = set(PHOTO_TYPES)  # kept as uploaded, so only types the model server r
 JOB_WORKERS = int(os.environ.get('FOTOMATES_JOB_WORKERS', '1'))
 WORKER = ThreadPoolExecutor(max_workers=JOB_WORKERS)
 
-IMAGE_WORKERS = int(os.environ.get('FOTOMATES_IMAGE_WORKERS', '1'))
 LOCK = threading.RLock()
 
 JOB_ID = r'^[a-f0-9]{32}$'
@@ -171,7 +170,7 @@ def process_image(job, item):
                     digit_confidence=result.digit_confidence, reread=best['reread'],
                     digit_margin=result.digit_margin, digit_runner_up=result.digit_runner_up,
                     digit_alternatives=result.digit_alternatives,
-                    rolling=result.rolling, device_type=result.device_type, decimal_digits=result.decimal_digits,
+                    device_type=result.device_type, decimal_digits=result.decimal_digits,
                     clear=result.clear, code_confidence=result.code_confidence,
                     **verdict(reading, read['score'], read['score_parts'], text=result.text,
                               clear=result.clear, cells=read['all_digits']))
@@ -194,10 +193,7 @@ def process_image(job, item):
 def image_workers(choice):
  
     slots = server_slots(choice.servers)
-    if choice.fixed_workers or not slots:
-        workers = choice.workers
-    else:
-        workers = min(IMAGE_WORKERS, slots * WORKERS_PER_SLOT)
+    workers = workers_for(choice, slots)
     print(f'reading with {workers} worker(s) on {choice.label}; model server slots: {slots or "not reported"}',
           flush=True)
     return workers
@@ -407,7 +403,6 @@ def read_now(image: UploadFile = File(...)):
         'evidence_source': result.evidence_source,
         'confidence': result.confidence,
         'digit_confidence': result.digit_confidence,
-        'rolling': result.rolling,
         'device_type': result.device_type,
         'decimal_digits': result.decimal_digits,
         'raw_text': result.text,

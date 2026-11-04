@@ -15,11 +15,9 @@ import sys
 import threading
 import time
 from evaluation import GROUPS as EVALUATION_GROUPS, evaluate, lines as evaluation_lines
-from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, RETAKE_SCORE, WORKERS_PER_SLOT, photo_bytes, photo_retake_reason, _reading_digits, ocr_image,
+from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, PROMPT, CROP_FIRST, REREAD_MODE, RETAKE_SCORE, extract_box, find_box, image_workers, photo_bytes, PhotoFileError, photo_retake_reason, _reading_digits, ocr_image,
                               server_slots, extract_blank, extract_no_meter, low_score_reasons, score_reading)
 
-NAME = re.compile(r'^(?P<contract>[^_]+)_(?P<stamp>\d{14})_(?P<operator>[^_]*)_(?P<reading>\d+)__'
-                  r'(?P<register>[^_]+)')
 AUDIT_DB = Path(__file__).resolve().parent / os.environ.get('FOTOMATES_AUDIT_DB', 'audit_readings.sqlite3')
 BATCH_LOOKUP = 900  # below SQLite's limit of host parameters per statement
 
@@ -50,8 +48,8 @@ CREATE TABLE IF NOT EXISTS readings (
     read_at           TEXT NOT NULL,
     model             TEXT,     -- the model that read the photo
     visual_decimals   INTEGER,  -- visually identified mechanical fractional wheels, or NULL
-    clear             REAL,     -- the model's chance of QUALITY: CLEAR, 0..1 (information only)
-    quality           TEXT      -- the model's QUALITY answer, CLEAR or POOR (information only)
+    clear             REAL,     -- how clear the model judged the photo, 0..1 (QUALITY; information only)
+    quality           TEXT      -- the model's QUALITY answer: CLEAR or POOR, or 0-10 (information only)
 ) WITHOUT ROWID;  -- the rows live in the picture_name index itself: one copy, smaller file
 CREATE INDEX IF NOT EXISTS readings_month ON readings(month, status, match);
 CREATE INDEX IF NOT EXISTS readings_contract ON readings(contract_id, month, register);
@@ -61,6 +59,7 @@ CREATE INDEX IF NOT EXISTS readings_contract ON readings(contract_id, month, reg
 # again later without reading the photo again. Added to old databases on connect.
 DETAIL_COLUMNS = (
     ('operator', 'TEXT'),               # who took the photo, from the file name
+    ('anomaly_code', 'TEXT'),           # the anomaly the reader chose (57-5701), from the file name
     ('latitude', 'REAL'),               # where, from the file name (41-35034332 -> 41.35034332)
     ('longitude', 'REAL'),
     ('device_type', 'TEXT'),            # digital / mechanical, as the model answered TYPE
@@ -73,6 +72,10 @@ DETAIL_COLUMNS = (
     ('too_many_digits', 'INTEGER'),     # 1: 12 or more digits read, score set to 0
     ('rolling', 'TEXT'),                # mechanical wheels caught turning, e.g. "6:6-7"
     ('reread', 'INTEGER'),              # 1: read a second time, enlarged, after an unsure first read
+    ('other_reading', 'TEXT'),          # the read not kept, its digits as read (zeros kept); NULL for one read
+    ('other_score', 'REAL'),            # its score
+    ('other_scale', 'TEXT'),            # how it was read: 1 (as the photo is) or 3 (enlarged 3x)
+    ('reads_agree', 'INTEGER'),         # 1: both reads gave the same digits, 0: they differ, NULL: one read
     ('photo_sent', 'TEXT'),             # what the model saw: original / enlarged(2x) / enhanced(is_dark,...)
     ('image_width', 'INTEGER'),         # the photo as stored, in pixels
     ('image_height', 'INTEGER'),
@@ -147,19 +150,41 @@ def split_decimals(reading, saved, visual_decimals=None):
     return str(whole), decimals, 'yes' if whole == saved_value else 'no'
 
 
-def parse_name(name, month=None):
+NAME_FIELDS = 8  # Contract_Time_Reader_Reading_AnomalyCode_Register_Lat_Lon
 
-    match = NAME.match(name)
-    if not match:
-        return dict(contract_id=name.split('_')[0] if '_' in name else Path(name).stem,
-                    date=None, month=month, register=None, saved_reading=None)
+
+def _coordinate(field):
+    """41-35034332 -> 41.35034332; None for anything else."""
+    match = re.fullmatch(r'(\d+)-(\d+)', field or '')
+    return float(f'{match[1]}.{match[2]}') if match else None
+
+
+def parse_name(name, month=None):
+    """What a photo's name says, read by position:
+    Contract_Time_Reader_Reading_AnomalyCode_Register_Lat_Lon, e.g.
+    AL0001116_20261023203720_OLSIIB_50_57-5701_ExpAmbPerbashket_41-47428715_19-55966892.jpg.
+    Contract and time come from the left; lat, lon, register, anomaly and reading from the
+    right; the reader is everything between (a reader's name may hold a _). The date is
+    the first 14 digits of the time field; an unreadable one gives date None and month as
+    given. The saved reading is the reading field when it is all digits, else None."""
+    fields = Path(name).stem.split('_')
+    taken = fields[1][:14] if len(fields) > 1 else ''
     try:
-        taken = datetime.strptime(match['stamp'], '%Y%m%d%H%M%S')
-        date, month = taken.strftime('%Y-%m-%d'), taken.strftime('%Y-%m')
+        stamp = datetime.strptime(taken, '%Y%m%d%H%M%S') if taken.isdigit() else None
     except ValueError:
-        date = None
-    return dict(contract_id=match['contract'], date=date, month=month,
-                register=match['register'], saved_reading=match['reading'])
+        stamp = None
+    date, month = (stamp.strftime('%Y-%m-%d'), stamp.strftime('%Y-%m')) if stamp else (None, month)
+    if len(fields) < NAME_FIELDS:  # not the usual shape: only the contract and date are sure
+        return dict(contract_id=fields[0], date=date, month=month, register=None, saved_reading=None,
+                    operator=None, anomaly_code=None, latitude=None, longitude=None)
+    reading, anomaly, register, lat, lon = fields[-5:]
+    latitude, longitude = _coordinate(lat), _coordinate(lon)
+    if not latitude and not longitude:  # 0-0_0-0: no position was recorded
+        latitude = longitude = None
+    return dict(contract_id=fields[0], date=date, month=month, register=register or None,
+                saved_reading=reading if reading.isdigit() else None,
+                operator='_'.join(fields[2:-5]) or None, anomaly_code=anomaly or None,
+                latitude=latitude, longitude=longitude)
 
 
 def photos(folders):
@@ -241,21 +266,22 @@ def unread(db, paths, retry_errors=True, only_failed=False):
         yield from flush()
 
 
-def failed_photos(db, folders):
+def failed_photos(db, folders, names=None):
     """The photos saved with a technical error (status 'error', "Gabim teknik" in
     the reports), found by name inside the given folders instead of by listing
     them: a day folder on the share holds over 100 000 files, and only these few
     are needed. A photo whose date (from its name) matches a folder's YYYY/MM/DD
     goes to that folder unchecked (a file check on the share costs ~2 s; a photo
     missing there fails its read and stays a technical error); any other is
-    looked for in every folder, and one not found is reported and left as it is."""
+    looked for in every folder, and one not found is reported and left as it is.
+    names: only these photos (the ones that failed in the current run)."""
     excluded = processing_exclusions()
     roots = [Path(folder) for folder in folders]
     missing = 0
     for (name,) in db.execute("SELECT picture_name FROM readings WHERE status = 'error' ORDER BY picture_name"):
-        if name in excluded:
+        if name in excluded or (names is not None and name not in names):
             continue
-        # The date opens the name's second field, also in names NAME does not fit
+        # The date opens the name's second field, also in names of an unusual shape
         # (a longer time stamp, empty fields).
         match = re.match(r'[^_]+_(\d{4})(\d{2})(\d{2})', name)
         day = Path(*match.groups()) if match else None
@@ -306,14 +332,28 @@ def record_retry_failure(filename, row):
         os.fsync(output.fileno())
 
 
+# Production values: a photo scored under 0.7 is read once more at 3x; FOTOMATES_REREAD_SCALE=1 turns it off.
 REREAD_BELOW = float(os.environ.get('FOTOMATES_REREAD_BELOW', '0.7'))
 # Every small photo is already read enlarged to FOTOMATES_MIN_SIDE (2x for 240x400), so the reread goes further.
 REREAD_SCALE = float(os.environ.get('FOTOMATES_REREAD_SCALE', '3'))
 
 
-def read_scored(path, saved, model=None, scale=1.0):
-    """One read of a photo with its consumption and its one score."""
-    result = ocr_image(path, model=model, scale=scale)
+def reread_rule():
+    """The re-read rule in words, for the log: 'reread below 0.7 at 3x' or 'reread off'."""
+    crop = f'crop first, kept at {REREAD_BELOW:g} or more, else the whole photo; ' if CROP_FIRST else ''
+    if REREAD_SCALE == 1:
+        return crop + 'reread off'
+    how = (f'from a crop ({REREAD_SCALE:g}x without a usable box)' if REREAD_MODE == 'crop' and not CROP_FIRST
+           else f'at {REREAD_SCALE:g}x')
+    return crop + f'reread below {REREAD_BELOW:g} {how}' + ('; the most confident read kept' if CROP_FIRST else '')
+
+
+def read_scored(path, saved, model=None, scale=1.0, crop=False, box=None):
+    """One read of a photo with its consumption and its one score. 'scale' says how it was
+    read: 1.0 as it is, 3.0 enlarged, or the crop's label, e.g. 'crop(2.71x)'."""
+    result = ocr_image(path, model=model, scale=scale, crop=crop, box=box)
+    label = re.search(r'crop\([^)]*\)', result.evidence_source or '') if crop else None
+    scale = label[0] if label else scale
     cells = _reading_digits(result.text) or ''
     # Scored from the photo alone, then compared with the saved reading.
     parts = score_reading(cells, result.digit_confidence, result.decimal_digits, result.digit_margin,
@@ -321,47 +361,75 @@ def read_scored(path, saved, model=None, scale=1.0):
                           result.device_type == 'mechanical') if cells else None
     whole, decimals, match = split_decimals(cells or None, saved, result.decimal_digits)
     return dict(result=result, cells=cells, whole=whole, decimals=decimals, match=match, parts=parts,
-                score=parts['total'] if parts else None)
+                score=parts['total'] if parts else None, scale=scale)
 
 
 def read_best(path, saved, model=None):
-    """The read of a photo: as it is, and once more enlarged only when the first
-    is unsure (score below REREAD_BELOW, or no reading); the read with the
-    higher score is kept. Visual mechanical decimal evidence overrides the
-    legacy saved-length rule; the saved value never decides which read is kept. Adds 'reread' (whether
-    a second read was made) and 'seconds' (model time of every read made)."""
+    """The read of a photo. With CROP_FIRST: the photo cut to its display (the box asked in
+    a request of its own) is read first and kept when its score is REREAD_BELOW (0.7) or
+    more; otherwise the whole photo is read too, then once more at REREAD_SCALE when still
+    unsure, and the read with the highest score of all is kept. Without CROP_FIRST: the whole
+    photo, and once more enlarged only when it is unsure; the higher score is kept. The saved
+    value never decides which read is kept. Adds 'reread' (more than one read made),
+    'seconds' (model time of every request made), and, after two reads or more, 'other' (the
+    best read not kept) and 'others' (every read not kept)."""
+    if not CROP_FIRST:
+        return _read_whole(path, saved, model)
+    crop, box, seconds = None, None, 0.0
+    try:
+        box = find_box(path, model)
+        seconds += box['seconds']
+        if box['box']:
+            crop = read_scored(path, saved, model, crop=True, box=box['box'])
+            seconds += crop['result'].reading_seconds or 0.0
+    except Exception as exc:
+        if _file_error(exc) is not None:
+            raise  # the share is gone: read_with_retries waits for it
+        crop = None  # the box or the crop could not be read: the whole photo is read
+    if crop and crop['score'] is not None and crop['score'] >= REREAD_BELOW:
+        return dict(crop, reread=False, seconds=seconds, box_answer=box['answer'])
+    whole = _read_whole(path, saved, model, unsure=lambda score: max(
+        score if score is not None else -1, crop['score'] if crop and crop['score'] is not None else -1) < REREAD_BELOW)
+    reads = [crop] if crop else []
+    reads += [whole] + ([whole['other']] if whole.get('other') else [])
+    reads = [dict(r, other=None) for r in reads]
+    best = max(reads, key=lambda r: r['score'] if r['score'] is not None else -1)  # a tie keeps the earlier read
+    others = sorted((r for r in reads if r is not best), key=lambda r: r['score'] if r['score'] is not None else -1,
+                    reverse=True)
+    return dict(best, reread=len(reads) > 1, seconds=seconds + whole['seconds'], other=others[0] if others else None,
+                others=others, box_answer=box['answer'] if box else None)
+
+
+def _read_whole(path, saved, model=None, unsure=None):
+    """The whole photo, and once more enlarged when unsure (by default: its score below
+    REREAD_BELOW); the read with the higher score is kept, the other in 'other'."""
+    unsure = unsure or (lambda score: score is None or score < REREAD_BELOW)
     first = read_scored(path, saved, model)
     first.update(reread=False, seconds=first['result'].reading_seconds or 0.0)
     if REREAD_SCALE == 1:
         return first  # no resizing: the same image read again gives the same answer (temperature 0)
-    if first['score'] is not None and first['score'] >= REREAD_BELOW:
+    if not unsure(first['score']):
         return first
     if extract_no_meter(first['result'].text):
         return first  # no meter in the photo: enlarging it shows none either
     try:
-        second = read_scored(path, saved, model, REREAD_SCALE)
+        if REREAD_MODE == 'crop':  # the box the first read gave; without a usable one, the 3x frame
+            second = read_scored(path, saved, model, REREAD_SCALE, crop=True,
+                                 box=extract_box(first['result'].text))
+        else:
+            second = read_scored(path, saved, model, REREAD_SCALE)
     except Exception:
         return first  # the first read stands when the second fails
     seconds = (first['result'].reading_seconds or 0.0) + (second['result'].reading_seconds or 0.0)
-    best = second if (second['score'] or -1) > (first['score'] or -1) else first
-    return dict(best, reread=True, seconds=seconds)
+    best, other = (second, first) if (second['score'] or -1) > (first['score'] or -1) else (first, second)
+    return dict(best, reread=True, seconds=seconds, other=other)
 
 
-_PLACE = re.compile(r'_(\d+)-(\d+)_(\d+)-(\d+)\.[^.]+$')
-
-
-def name_details(name):
-    """The operator and the coordinates the file name carries (…_OPERATOR_…_41-35034332_19-86586937.jpg)."""
-    match, place = NAME.match(name), _PLACE.search(name)
-    lat = lon = None
-    if place and place[1] != '0':
-        lat, lon = float(f'{place[1]}.{place[2]}'), float(f'{place[3]}.{place[4]}')
-    return dict(operator=(match['operator'] or None) if match else None, latitude=lat, longitude=lon)
-
-
-def read_details(result, reading, reread):
+def read_details(result, reading, reread, other=None, others=None, box_answer=None):
     """What a read knows beyond the reading: per-digit probabilities and second choices,
-    the register code cut off, the model's answer and what it was shown."""
+    the register code cut off, the model's answer and what it was shown, and, after two
+    reads, the read not kept (other, from read_best): its digits, score and scale, whether
+    both gave the same digits, and its answer after the kept one's."""
     def numbers(values):
         return ' '.join(f'{p:.3f}' for p in values) if values else None
     probabilities = list(result.digit_confidence or [])
@@ -381,13 +449,23 @@ def read_details(result, reading, reread):
         weakest_digit=round(min(probabilities), 3) if aligned and probabilities else None,
         code_removed=written[:len(result.code_confidence or [])] or None,
         code_probabilities=numbers(result.code_confidence),
-        rolling=', '.join(f"{w['position']}:{w['lower']}-{w['upper']}" if w.get('position') else 'turning'
-                          for w in result.rolling or []) or None,
+        rolling=None,  # no longer asked (prompt v2 has no ROLLING line); the column stays
         reread=int(bool(reread)), photo_sent=result.evidence_source,
         image_width=image.get('width'), image_height=image.get('height'),
         blur=image.get('blur_variance'), contrast=image.get('contrast'), brightness=image.get('brightness'),
         glare_fraction=image.get('glare_fraction'), image_flags=','.join(flags) or None,
-        model_answer=result.text)
+        other_reading=(other['cells'] or None) if other else None,
+        other_score=other['score'] if other else None,
+        other_scale=_scale_label(other['scale']) if other else None,
+        reads_agree=int((reading or '') == other['cells']) if other else None,
+        model_answer=result.text + ''.join(f"\n--- other read ({_scale_label(o['scale'])}) ---\n{o['result'].text}"
+                                           for o in (others if others is not None else [other] if other else []))
+        + (f"\n--- box (own request) ---\n{box_answer}" if box_answer else ''))
+
+
+def _scale_label(scale):
+    """1.0 -> '1', 3.0 -> '3', a crop's label as it is."""
+    return f'{scale:g}' if isinstance(scale, (int, float)) else str(scale)
 
 
 # A photo whose read fails (the share or the model server gone for a moment) is read again
@@ -396,22 +474,125 @@ PHOTO_RETRIES = int(os.environ.get('FOTOMATES_PHOTO_RETRIES', '3'))
 RETRY_WAITS = (2, 5, 10)
 
 
-def read_with_retries(path, saved, model=None):
-    for attempt in range(PHOTO_RETRIES + 1):
+# A photo share that stops answering (an OSError reading the file, before any model
+# request) is an outage, not a failure of the photo: every worker pauses while one probe
+# looks at the photo's folder every SHARE_POLL seconds, for at most SHARE_WAIT seconds.
+SHARE_POLL = float(os.environ.get('FOTOMATES_SHARE_POLL', '15'))
+SHARE_WAIT = float(os.environ.get('FOTOMATES_SHARE_WAIT', '1800'))
+SHARE_LOG_EVERY = 60
+
+
+def _file_error(exc):
+    """The PhotoFileError behind exc (a read failure wraps it), or None."""
+    while exc is not None:
+        if isinstance(exc, PhotoFileError):
+            return exc
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def _folder_answers(folder):
+    try:
+        with os.scandir(folder) as entries:
+            next(entries, None)
+        return True
+    except OSError:
+        return False
+
+
+class ShareGuard:
+    """One wait for the whole run while the photo share is gone: workers pause before
+    each read, one probe thread checks the failing photo's folder, and all resume
+    when it answers (or give up when SHARE_WAIT has passed)."""
+
+    def __init__(self, poll=SHARE_POLL, limit=SHARE_WAIT, answers=_folder_answers):
+        self.poll, self.limit, self.answers = poll, limit, answers
+        self.open = threading.Event()
+        self.open.set()
+        self.lock = threading.Lock()
+        self.outage = None
+
+    def pause(self):
+        """Wait here while an outage is going on."""
+        self.open.wait()
+
+    def wait_for(self, path):
+        """After the file of path could not be read: None when its folder answers at once
+        (the share is fine, the photo's own file failed), True when the share came back
+        after a wait (read the photo again), False when SHARE_WAIT passed without it."""
+        with self.lock:
+            outage = self.outage
+            if outage is None:
+                if self.answers(path.parent):
+                    return None
+                outage = self.outage = dict(done=threading.Event(), back=False)
+                self.open.clear()
+                threading.Thread(target=self._probe, args=(path, outage), daemon=True,
+                                 name='share-probe').start()
+        outage['done'].wait()
+        return outage['back']
+
+    def _probe(self, path, outage):
+        started = last_log = time.monotonic()
+        print(f'SHARE photo share not answering ({path.parent}); every worker paused, checking '
+              f'every {self.poll:g} s for up to {self.limit:g} s', flush=True)
+        while True:
+            time.sleep(self.poll)
+            if self.answers(path.parent):
+                outage['back'] = True
+                break
+            now = time.monotonic()
+            if now - started >= self.limit:
+                break
+            if now - last_log >= SHARE_LOG_EVERY:
+                last_log = now
+                print(f'SHARE still waiting for the photo share: {now - started:.0f} s of {self.limit:g} s', flush=True)
+        photo_bytes.cache_clear()  # never use a copy taken while the share was failing
+        waited = time.monotonic() - started
+        print(f'SHARE photo share back after {waited:.0f} s; reading resumes' if outage['back'] else
+              f'SHARE photo share still gone after {waited:.0f} s; the photos waiting are saved as errors',
+              flush=True)
+        with self.lock:
+            self.outage = None
+            self.open.set()
+            outage['done'].set()
+
+
+SHARE = ShareGuard()
+
+
+def read_with_retries(path, saved, model=None, share=None):
+    """read_best with retries. A model-server error is read again up to PHOTO_RETRIES
+    times after RETRY_WAITS; a file that cannot be read because the share is gone waits
+    for the share instead (not counted), and the photo is then read as if for the first time."""
+    share = share or SHARE
+    attempt = 0
+    while True:
+        share.pause()
         try:
             return read_best(path, saved, model)
         except Exception as exc:
-            if attempt == PHOTO_RETRIES:
-                raise
-            wait = RETRY_WAITS[min(attempt, len(RETRY_WAITS) - 1)]
-            print(f'retry {attempt + 1}/{PHOTO_RETRIES} in {wait} s: {path.name}: '
-                  f'{type(exc).__name__}: {str(exc)[:160]}', flush=True)
-            time.sleep(wait)
-            photo_bytes.cache_clear()  # never read again a copy taken while the share was failing
+            failure = exc
+            if _file_error(exc) is not None:
+                back = share.wait_for(path)
+                if back:
+                    attempt = 0
+                    continue  # the share answers again: read the photo afresh
+                if back is False:
+                    raise  # the share stayed gone for SHARE_WAIT: saved as an error
+                # back is None: the folder answers, so this photo's own file failed: a normal retry
+        if attempt == PHOTO_RETRIES:
+            raise failure
+        wait = RETRY_WAITS[min(attempt, len(RETRY_WAITS) - 1)]
+        print(f'retry {attempt + 1}/{PHOTO_RETRIES} in {wait} s: {path.name}: '
+              f'{type(failure).__name__}: {str(failure)[:160]}', flush=True)
+        attempt += 1
+        time.sleep(wait)
+        photo_bytes.cache_clear()  # never read again a copy taken while the share was failing
 
 
 def read_one(path, month, model=None):
-    row = dict(parse_name(path.name, month), **name_details(path.name))
+    row = parse_name(path.name, month)  # contract, date, register, saved reading, reader, anomaly, place
     started = time.monotonic()
     try:
         read = read_with_retries(path, row['saved_reading'], model)
@@ -432,11 +613,12 @@ def read_one(path, month, model=None):
     else:
         status = 'done'
     whole, decimals, match, score = read['whole'], read['decimals'], read['match'], read['score']
-    quality = re.findall(r'^QUALITY:[ \t]*\**[ \t]*(CLEAR|POOR)', result.text, re.IGNORECASE | re.MULTILINE)
+    quality = re.findall(r'^QUALITY:[ \t]*\**[ \t]*(CLEAR|POOR|\d+)', result.text, re.IGNORECASE | re.MULTILINE)
     reason = photo_retake_reason(reading, result.clear) if reading else None
     if not reason and score is not None and score < RETAKE_SCORE:
         reason = low_score_reasons(read['parts'])[0] if read['parts'] else 'the overall confidence is low'
-    details = read_details(result, reading, read.get('reread'))
+    details = read_details(result, reading, read.get('reread'), read.get('other'), read.get('others'),
+                           read.get('box_answer'))
     too_long = bool(read['parts'] and read['parts'].get('too_long'))
     return dict(row, **details, model=model_backend(model).model, picture_name=path.name, extracted_reading=reading,
                 extracted_whole=whole, extracted_decimals=decimals, match=match,
@@ -466,11 +648,12 @@ def command_read(args):
     db = connect(args.db)
     choice = model_backend(args.model)
     slots = server_slots(choice.servers)
-    workers = args.workers or (choice.workers if choice.fixed_workers or not slots else slots * WORKERS_PER_SLOT)
+    workers = args.workers or image_workers(choice, slots)
     print(f'reading with {workers} worker(s) into {args.db}; model {choice.label}; model server slots: '
-          f'{slots or "not reported"}', flush=True)
+          f'{slots or "not reported"}; prompt {PROMPT}; {reread_rule()}', flush=True)
     started = time.monotonic()
     count = matched = failed = rejected = codes = too_long = 0
+    failed_now = {}  # picture name -> path of the photos saved as an error in this run
     saved_names_so_far = {row[0] for row in db.execute('SELECT picture_name FROM readings')}
     print(f'Resuming with {len(saved_names_so_far)} saved photos; completed photos are skipped.', flush=True)
     model_seconds = 0.0
@@ -540,8 +723,12 @@ def command_read(args):
             row = future.result()
             save(db, row)
             db.commit()  # a printed result is already durable, even after a disconnect
-            if row['status'] == 'error' and failure_csv:
-                record_retry_failure(failure_csv, row)
+            if row['status'] == 'error':
+                failed_now[row['picture_name']] = row.get('source_path')
+                if failure_csv:
+                    record_retry_failure(failure_csv, row)
+            else:
+                failed_now.pop(row['picture_name'], None)
             saved_names_so_far.add(row['picture_name'])
             count += 1
             matched += row['match'] == 'yes'
@@ -564,7 +751,10 @@ def command_read(args):
                       + (f" | quality={row['quality'] or '-'} ({100 * row['clear']:.0f}% clear, info only)"
                          if row.get('clear') is not None else '')
                       + (f" | code removed={row['code']}" if row.get('code') else '')
-                      + (f" | REJECTED: {row['reason']}" if row.get('reason') else ''), flush=True)
+                      + (f" | REJECTED: {row['reason']}" if row.get('reason') else '')
+                      + (f" | other={row['other_reading'] or '-'}/"
+                         + ('-' if row.get('other_score') is None else f"{row['other_score']:.3f}")
+                         if row.get('reads_agree') is not None else ''), flush=True)
                 if row['error']:
                     print(f"  error: {row['error']}", flush=True)
             if count % args.progress == 0:
@@ -582,6 +772,41 @@ def command_read(args):
         if report_every and count - last_report_count >= report_every:
             checkpoint_reports()
 
+    def read_all(paths, limit=None):
+        nonlocal pending
+        for path in paths:
+            # Save and print what has finished as it finishes: with many workers
+            # the queue is rarely full, so waiting for that would hold every result.
+            done, pending = wait(pending, timeout=0 if len(pending) < workers * 2 else None,
+                                 return_when=FIRST_COMPLETED)
+            collect(done)
+            pending.add(pool.submit(read_one, path, args.month, choice.key))
+            if limit and count + len(pending) >= limit:
+                break
+
+    def errors_again():
+        """One more pass over the photos saved as an error in this run."""
+        nonlocal pending, count, failed
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            collect(done)
+        if not failed_now:
+            return
+        names = dict(failed_now)
+        print(f'Reading again the {len(names)} photo(s) saved as an error in this run', flush=True)
+        count -= len(names)  # each is counted once, by its new result
+        failed -= len(names)
+        if args.folders:
+            paths = failed_photos(db, args.folders, set(names))
+        else:  # --files-csv: the path each was read from
+            paths = (Path(source) for source in names.values() if source)
+        read_all(paths)
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            collect(done)
+        print(f'After the second pass: {len(names) - len(failed_now)} read, {len(failed_now)} still an error',
+              flush=True)
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
         try:
             # --only-failed: the photos with a technical error, found by name; no
@@ -592,15 +817,9 @@ def command_read(args):
             else:
                 paths = (listed(failed_photos(db, args.folders)) if args.only_failed else
                          unread(db, listed(prefetch(photos(args.folders))), retry_errors=not args.skip_errors))
-            for path in paths:
-                # Save and print what has finished as it finishes: with many workers
-                # the queue is rarely full, so waiting for that would hold every result.
-                done, pending = wait(pending, timeout=0 if len(pending) < workers * 2 else None,
-                                     return_when=FIRST_COMPLETED)
-                collect(done)
-                pending.add(pool.submit(read_one, path, args.month, choice.key))
-                if args.limit and count + len(pending) >= args.limit:
-                    break
+            read_all(paths, args.limit)
+            if not args.skip_errors:
+                errors_again()
         except (OSError, KeyboardInterrupt) as exc:
             interruption = exc
             print(f'Scan interrupted: {exc or "keyboard interrupt"}. Saving remaining completed requests before exit.', flush=True)
@@ -730,8 +949,29 @@ def summary(db, month=None):
                ROUND(100.0 * SUM(match = 'yes') / NULLIF(SUM(status IN ('done', 'missing')), 0), 2)
                    AS percent_correct,
                COUNT(DISTINCT contract_id) AS contracts,
-               ROUND(AVG(seconds), 2) AS seconds_per_photo
+               ROUND(AVG(seconds), 2) AS seconds_per_photo,
+               SUM(reads_agree IS NOT NULL) AS reread_photos,
+               SUM(reads_agree = 1) AS reread_agree,
+               SUM(reads_agree = 0) AS reread_differ,
+               SUM(reads_agree = 0 AND {_saved_match(_FIRST_READ)}) AS differ_first_matched,
+               SUM(reads_agree = 0 AND {_saved_match(_SECOND_READ)}) AS differ_second_matched
         FROM readings {where} GROUP BY month ORDER BY month""", params)
+
+
+# Of two reads, the first (as the photo is, scale 1) and the second (enlarged): the one
+# not kept is other_reading, the kept one extracted_reading.
+_FIRST_READ = "CASE WHEN other_scale = '1' THEN other_reading ELSE extracted_reading END"
+_SECOND_READ = "CASE WHEN other_scale = '1' THEN extracted_reading ELSE other_reading END"
+
+
+def _saved_match(digits):
+    """SQL: 1 when these digits, by the saved reading's length (split_decimals), give
+    the saved reading: its leading digits, past the zeros, are the saved number (for a
+    saved 0: at most MAX_DECIMALS digits past the zeros)."""
+    value, saved = f"ltrim(COALESCE({digits}, ''), '0')", "ltrim(saved_reading, '0')"
+    return (f"(CASE WHEN saved_reading IS NULL OR {digits} IS NULL THEN 0 "
+            f"WHEN {saved} = '' THEN length({value}) <= {MAX_DECIMALS} "
+            f"ELSE length({value}) >= length({saved}) AND substr({value}, 1, length({saved})) = {saved} END)")
 
 
 LIST_KINDS = ('mismatches', 'missing', 'duplicates', 'all')
@@ -825,6 +1065,38 @@ def command_import_log(args):
     db.commit()
     print(f'{added} photo(s) imported into {args.db}; {present} already there; '
           f'{failed} failed in the log and left to read again', flush=True)
+
+
+NAME_COLUMNS = ('contract_id', 'date', 'month', 'register', 'operator', 'saved_reading', 'anomaly_code',
+                'latitude', 'longitude')
+
+
+def command_reparse(args):
+    """Read every stored photo's name again by the current rule (contract, date, month,
+    register, reader, saved reading, anomaly code, place) and match its stored reading
+    again, without reading any photo again. A read photo's status follows its saved
+    reading: done with one, no_saved_reading without. Prints how many rows changed."""
+    db = connect(args.db)
+    changed = total = 0
+    columns = (*NAME_COLUMNS, 'extracted_whole', 'extracted_decimals', 'match', 'status')
+    rows = db.execute(f'SELECT picture_name, extracted_reading, visual_decimals, {",".join(columns)} '
+                      'FROM readings').fetchall()
+    for name, reading, visual_decimals, *before in rows:
+        before = dict(zip(columns, before))
+        row = parse_name(name, args.month or before['month'])
+        whole, decimals, match = split_decimals(reading, row['saved_reading'], visual_decimals)
+        status = before['status']
+        if status in ('done', 'no_saved_reading'):
+            status = 'done' if row['saved_reading'] else 'no_saved_reading'
+        after = dict({c: row[c] for c in NAME_COLUMNS}, extracted_whole=whole, extracted_decimals=decimals,
+                     match=match, status=status)
+        total += 1
+        if after != before:
+            changed += 1
+            db.execute(f'UPDATE readings SET {", ".join(c + " = ?" for c in columns)} WHERE picture_name = ?',
+                       [after[c] for c in columns] + [name])
+    db.commit()
+    print(f'{total} photo names read again, {changed} rows changed', flush=True)
 
 
 def command_rematch(args):
@@ -931,7 +1203,11 @@ def summary_lines(totals):
             f"{t['mismatch']} mismatch ({t['mismatch_high_score']} high score, {t['mismatch_low_score']} low score), "
             f"{t['missing_reading']} no reading, {t['no_meter']} no meter, {t['blank']} blank, "
             f"{t['no_saved_reading']} no saved reading, {t['failed']} failed, "
-            f"{t['seconds_per_photo']} s per photo" for t in totals]
+            f"{t['seconds_per_photo']} s per photo"
+            + (f"; read twice {t['reread_photos']}: {t['reread_agree']} same digits, {t['reread_differ']} different "
+               f"(of these, the first read matched the saved reading {t['differ_first_matched']} times, "
+               f"the second {t['differ_second_matched']})" if t.get('reread_photos') else '')
+            for t in totals]
 
 
 def write_extra_reports(db, out, month=None):
@@ -1029,7 +1305,8 @@ def main():
     read.add_argument('--model', choices=list(MODEL_BACKENDS), default='default',
                       help='model choice: default (FOTOMATES_OCR_URL) or m1, m2, ... from FOTOMATES_MODELS')
     read.add_argument('--limit', type=int, help='stop after this many photos (for a speed test)')
-    read.add_argument('--skip-errors', action='store_true', help='do not retry photos that failed before')
+    read.add_argument('--skip-errors', action='store_true', help='do not retry photos that failed before, nor, at the end, '
+                           'the ones that failed in this run')
     read.add_argument('--only-failed', action='store_true',
                       help='read again only the photos saved with a technical error ("Gabim teknik"), '
                            'nothing new; they are found by name, the folders are not listed')
@@ -1055,6 +1332,12 @@ def main():
 
     rematch = commands.add_parser('rematch', help='match the stored readings again, without reading photos')
     rematch.set_defaults(run=command_rematch)
+
+    reparse = commands.add_parser('reparse', help='read every stored photo name again by the current rule '
+                                                  '(and match again), without reading photos')
+    reparse.add_argument('--month', help='YYYY-MM for photos whose name carries no readable date '
+                                          '(default: the month each row has now)')
+    reparse.set_defaults(run=command_reparse)
 
     report = commands.add_parser('report', help='write the CSV reports')
     report.add_argument('--out', default='reports/audit')
