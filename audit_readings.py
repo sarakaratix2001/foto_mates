@@ -123,6 +123,11 @@ def split_decimals(reading, saved, visual_decimals=None):
     reading = re.sub(r'\D', '', reading or '')  # a reading stored with its decimal point
     if not reading:
         return None, None, 'no'
+    # The saved reading's length places the decimal point, also on mechanical counters: the
+    # model's own count of decimal wheels (colour, "-small") is only used when the file name
+    # has no saved reading, or a saved 0, to go by.
+    if saved and int(saved):
+        visual_decimals = None
     if visual_decimals is not None:
         if type(visual_decimals) is not int or not 0 <= visual_decimals < len(reading):
             raise ValueError('visual_decimals must be a nonnegative count smaller than the digit count')
