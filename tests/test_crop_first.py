@@ -22,7 +22,8 @@ PHOTO = Path('AL0010556_20261023092021_JURGENDU_1111__ExpAktiv_41-33_19-82.jpg')
 
 def read(cells, score, scale):
     result = NS(text=f'READING: {cells}', reading_seconds=1.0, digit_confidence=[0.9] * len(cells),
-                digit_alternatives=[], image_report={}, device_type='digital', code_confidence=[],
+                digit_alternatives=[{d: 0.9, '7': 0.1} for d in cells], image_report={}, device_type='digital',
+                code_confidence=[],
                 evidence_source=str(scale), clear=None, decimal_digits=None)
     return dict(result=result, cells=cells, score=score, scale=scale, whole=cells, decimals=0, match='no', parts=None)
 

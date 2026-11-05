@@ -425,7 +425,7 @@ def _read_whole(path, saved, model=None, unsure=None):
     return dict(best, reread=True, seconds=seconds, other=other)
 
 
-def read_details(result, reading, reread, other=None, others=None, box_answer=None):
+def read_details(result, reading, reread, other=None, other_reads=None, box_answer=None):
     """What a read knows beyond the reading: per-digit probabilities and second choices,
     the register code cut off, the model's answer and what it was shown, and, after two
     reads, the read not kept (other, from read_best): its digits, score and scale, whether
@@ -459,7 +459,7 @@ def read_details(result, reading, reread, other=None, others=None, box_answer=No
         other_scale=_scale_label(other['scale']) if other else None,
         reads_agree=int((reading or '') == other['cells']) if other else None,
         model_answer=result.text + ''.join(f"\n--- other read ({_scale_label(o['scale'])}) ---\n{o['result'].text}"
-                                           for o in (others if others is not None else [other] if other else []))
+                                           for o in (other_reads if other_reads is not None else [other] if other else []))
         + (f"\n--- box (own request) ---\n{box_answer}" if box_answer else ''))
 
 
