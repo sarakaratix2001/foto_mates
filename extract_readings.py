@@ -43,9 +43,11 @@ def _required_env(name: str) -> str:
 # Enhancement before reading. auto: only photos assess() flags with one of
 # ENHANCE_WHEN are corrected, every other photo is sent as its original file.
 # always: every photo is corrected. never: every photo is sent as its original file.
+# whole: as auto for a whole photo, and a crop is never corrected (a crop of a bright LCD is
+# often flagged, and the correction can cost a digit a stroke at that size).
 _ENHANCE_MODE = os.environ.get('FOTOMATES_ENHANCE', 'auto').strip().lower()
-if _ENHANCE_MODE not in ('auto', 'always', 'never'):
-    raise ValueError(f"FOTOMATES_ENHANCE must be 'auto', 'always' or 'never', not {_ENHANCE_MODE!r}")
+if _ENHANCE_MODE not in ('auto', 'always', 'never', 'whole'):
+    raise ValueError(f"FOTOMATES_ENHANCE must be 'auto', 'always', 'never' or 'whole', not {_ENHANCE_MODE!r}")
 _ENHANCE_WHEN = tuple(flag.strip() for flag in os.environ.get(
     'FOTOMATES_ENHANCE_WHEN', 'is_low_contrast,is_dark,is_bright,has_glare').split(',') if flag.strip())
 # Shorter side, in pixels, a photo is enlarged to before it is read; 0 sends it at its own size.
@@ -332,7 +334,9 @@ def _reading_digits(text: str) -> str:
     return reading
  
 def extract_decimal_digits(text: str) -> int | None:
-    if extract_device_type(text) != 'mechanical':
+    """The DECIMALS count the model wrote: on a mechanical counter, and with prompt v3 (which
+    asks it for every meter) on a digital display too."""
+    if extract_device_type(text) != 'mechanical' and PROMPT != 'v3':
         return None
     answers = re.findall(r'^DECIMALS:[ \t]*(\d+|UNKNOWN)[ \t]*$', text, re.IGNORECASE | re.MULTILINE)
     count = int(answers[-1]) if answers and answers[-1].isdigit() else None
@@ -361,6 +365,28 @@ class OcrResult:
     image_report: dict | None = None         # the photo's size and quality checks (blur, contrast, glare, ...)
     reading_seconds: float | None = None     # the model reading the photo plus digit extraction
     sent_png: bytes | None = None            # the enhanced photo the model read; None: it read the original
+
+
+# A black frame: the whole photo's grey mean and grey standard deviation (0..255) are both
+# below this. It is answered BLANK without any model request and is never brightened; 0 turns
+# the check off. In October no photo below 5 on both was ever read.
+BLANK_MAX = float(os.environ.get('FOTOMATES_BLANK_MAX', '5'))
+
+
+def blank_photo(image_path: Path) -> OcrResult | None:
+    """The result of a black frame, made without a model request (READING: BLANK,
+    photo_sent 'blank-check'); None when the photo is not one or BLANK_MAX is 0."""
+    if BLANK_MAX <= 0:
+        return None
+    pixels = decode_image(Path(image_path))
+    report = assess(pixels)
+    if not (report['brightness'] < BLANK_MAX and report['contrast'] < BLANK_MAX):
+        return None
+    note = (f"black frame: brightness {report['brightness']:.1f}, contrast {report['contrast']:.1f}, "
+            f"both below {BLANK_MAX:g}; no model request")
+    return OcrResult('TYPE: BLANK\nREADING: BLANK\n--- ' + note + ' ---', evidence_source='blank-check',
+                     reading_seconds=0.0,
+                     image_report=dict(report, width=int(pixels.shape[1]), height=int(pixels.shape[0])))
 
 
 RETAKE_SCORE = float(os.environ.get('FOTOMATES_RETAKE_SCORE', '0.5'))
@@ -787,42 +813,134 @@ _V2_USER_PROMPT = (
     "photo, or the display shows a test pattern (all segments lit, or every cell the "
     "same) instead of the reading.")
 
-# Which prompt reads the photos: v2 (the default since the 4 Nov test: as accurate as compact, ~30% faster) or compact. Anything else is an error,
+
+
+def _swap(text: str, old: str, new: str) -> str:
+    """text with old replaced by new; an error when old is not there exactly once."""
+    if text.count(old) != 1:
+        raise ValueError(f'prompt text not found once: {old[:50]!r}')
+    return text.replace(old, new)
+
+
+# v3: v2 with DECIMALS asked for every meter. On a digital display the model counts the
+# smaller cell(s) at the right end, the cell it otherwise drops (0009261.9 read as 000926).
+_V3_SYSTEM_PROMPT = _swap(
+    _V2_SYSTEM_PROMPT,
+    "DECIMALS: on a mechanical counter, the number of wheels at the right end with a "
+    "smaller digit or a box of another colour, 0 if none; on a digital display, UNKNOWN\n",
+    "DECIMALS: the number of cells at the right end of the row that are smaller than the "
+    "others, in a box of another colour, or after a dot or comma; 0 if none (on a mechanical "
+    "counter: the wheels with a smaller digit or a box of another colour)\n")
+_V3_USER_PROMPT = _swap(_swap(
+    _V2_USER_PROMPT, "DECIMALS (mechanical counters)\n", "DECIMALS\n"),
+    "and colour: DECIMALS: 0.\n",
+    "and colour: DECIMALS: 0.\n"
+    "- On a digital display: the cells at the right end of the row that are smaller than the "
+    "others or come after a dot or comma. Example: a digital display of seven large cells "
+    "then one smaller cell: DECIMALS: 1; keep that cell in CELLS and READING.\n")
+
+# Which prompt reads the photos: v2 (the default since the 4 Nov test: as accurate as compact, ~30% faster), compact, or v3
+# (v2 with DECIMALS on digital displays too; not the default until its test passes). Anything else is an error,
 # so a typo cannot select another prompt silently.
 PROMPTS = {'compact': (_COMPACT_SYSTEM_PROMPT, _COMPACT_USER_PROMPT),
-           'v2': (_V2_SYSTEM_PROMPT, _V2_USER_PROMPT)}
+           'v2': (_V2_SYSTEM_PROMPT, _V2_USER_PROMPT),
+           'v3': (_V3_SYSTEM_PROMPT, _V3_USER_PROMPT)}
 PROMPT = os.environ.get('FOTOMATES_PROMPT', 'v2').strip().lower()
 if PROMPT not in PROMPTS:
-    raise ValueError(f"FOTOMATES_PROMPT must be 'compact' or 'v2', not {PROMPT!r}")
+    raise ValueError(f"FOTOMATES_PROMPT must be 'compact', 'v2' or 'v3', not {PROMPT!r}")
 _SYSTEM_PROMPT, _USER_PROMPT = PROMPTS[PROMPT]
 
-# How an unsure photo is read the second time: enlarge (the whole frame, 3x; the default)
-# or crop (cut to the box the first read gives around the display, then enlarged).
-REREAD_MODE = os.environ.get('FOTOMATES_REREAD_MODE', 'enlarge').strip().lower()
+
+def _on(name: str) -> bool:
+    return os.environ.get(name, '0').strip().lower() not in ('0', 'false', 'no', 'off', '')
+
+
+# FOTOMATES_REPEAT_HINT=1 (default off): one more line under WHAT TO READ, against a run of
+# the same digit read one cell short (a saved 111 read as 11).
+REPEAT_HINT = _on('FOTOMATES_REPEAT_HINT')
+_REPEAT_LINE = ("- Adjacent identical digits are separate cells, above all 1s: a 1 is a narrow bar "
+                "with a wide gap on each side; count the cells, write every one.\n")
+if REPEAT_HINT:
+    _USER_PROMPT = _swap(_USER_PROMPT, "\nWHAT TO IGNORE\n", _REPEAT_LINE + "\nWHAT TO IGNORE\n")
+
+# FOTOMATES_FEWSHOT=1 (default off): example photos with their CELLS line, sent in the user
+# message before the photo to read. They are the rows of fewshot/examples.csv (file, cells):
+# small crops of real displays, a few hundred prompt tokens in all.
+FEWSHOT = _on('FOTOMATES_FEWSHOT')
+FEWSHOT_DIR = Path(os.environ.get('FOTOMATES_FEWSHOT_DIR', '') or Path(__file__).resolve().parent / 'fewshot')
+
+
+def load_fewshots(folder: Path = FEWSHOT_DIR) -> list:
+    """The example photos as message parts: for each row of examples.csv a caption, the
+    image and its CELLS line. An error when the list or a file is missing or a row is bad:
+    a run asked to use examples must not go without them silently."""
+    import csv
+    parts = []
+    with open(Path(folder) / 'examples.csv', encoding='utf-8-sig', newline='') as file:
+        rows = [row for row in csv.DictReader(file) if (row.get('file') or '').strip()]
+    for number, row in enumerate(rows, 1):
+        cells = re.sub(r'\D', '', row.get('cells') or '')
+        if not cells:
+            raise ValueError(f"fewshot/examples.csv: no digits in cells for {row['file']}")
+        data = (Path(folder) / row['file'].strip()).read_bytes()
+        kind = 'jpeg' if row['file'].lower().endswith(('.jpg', '.jpeg')) else 'png'
+        parts += [{'type': 'text', 'text': f'Example {number} (another meter, already read):'},
+                  {'type': 'image_url', 'image_url': {
+                      'url': f'data:image/{kind};base64,' + base64.b64encode(data).decode('ascii')}},
+                  {'type': 'text', 'text': 'CELLS: ' + ' '.join(cells)}]
+    if not parts:
+        raise ValueError('fewshot/examples.csv has no examples')
+    return parts
+
+
+_FEWSHOTS = load_fewshots() if FEWSHOT else []
+
+# Crop first (the default): every photo is first read cut to its display, the box asked in
+# a request of its own; FOTOMATES_CROP_FIRST=0 reads the whole photo first, as before.
+CROP_FIRST = os.environ.get('FOTOMATES_CROP_FIRST', '1').strip() not in ('0', 'false', 'no', 'off', '')
+# How an unsure photo is read once more after the whole photo: enlarge (the whole frame, 3x)
+# or crop (cut to the box the whole-photo read gives around the display, then enlarged).
+# The default is crop with crop first (3x adds no detail to a photo already enlarged; the
+# whole read's box is a second estimate, independent of the box finder's), else enlarge.
+REREAD_MODE = (os.environ.get('FOTOMATES_REREAD_MODE', '').strip().lower()
+               or ('crop' if CROP_FIRST else 'enlarge'))
 if REREAD_MODE not in ('enlarge', 'crop'):
     raise ValueError(f"FOTOMATES_REREAD_MODE must be 'enlarge' or 'crop', not {REREAD_MODE!r}")
 # The crop: this share of the box's longer side added on every side, then enlarged so it is
 # CROP_WIDTH px wide (its shorter side never below FOTOMATES_MIN_SIDE).
 CROP_MARGIN = float(os.environ.get('FOTOMATES_CROP_MARGIN', '0.25'))
 CROP_WIDTH = int(os.environ.get('FOTOMATES_CROP_WIDTH', '650'))
+# The margin of the crop read after the whole photo, with crop first: wider than CROP_MARGIN,
+# so a cell cut off at the edge of the first crop is inside this one.
+THIRD_MARGIN = float(os.environ.get('FOTOMATES_THIRD_MARGIN', '0.5'))
 # A box is used only when it looks like a display: its share of the photo's width and
 # height, and its own width / height (in pixels). Width up to 100%: a display can fill it.
 BOX_WIDTH, BOX_HEIGHT, BOX_ASPECT = (0.15, 1.0), (0.04, 0.60), (1.2, 8.0)
+# FOTOMATES_ROTATED=1 (default off): a box taller than wide (a display photographed sideways)
+# is accepted when its height / width is within BOX_ASPECT; the cut is turned 90 degrees
+# before it is read.
+ROTATED = _on('FOTOMATES_ROTATED')
 _BOX_LINE = ("BOX: x1 y1 x2 y2: the box around the register display or counter window, every "
              "digit of the row inside it, as numbers from 0 to 1000 of the photo (x from the left "
              "edge, y from the top edge); NONE when there is none\n")
-if REREAD_MODE == 'crop':  # the first read also says where the display is
-    _SYSTEM_PROMPT = (_SYSTEM_PROMPT.replace('exactly these seven lines', 'exactly these eight lines')
-                      .replace('exactly these five lines', 'exactly these six lines'))
-    _at = _SYSTEM_PROMPT.rindex('QUALITY:')
-    _SYSTEM_PROMPT = _SYSTEM_PROMPT[:_at] + _BOX_LINE + _SYSTEM_PROMPT[_at:]
+# With REREAD_MODE crop the read of the whole photo also says where the display is. A read
+# of a crop is not asked: its box is of no use, and its prompt stays the one without the line.
+_at = _SYSTEM_PROMPT.rindex('QUALITY:')
+_BOX_SYSTEM_PROMPT = (_SYSTEM_PROMPT[:_at].replace('exactly these seven lines', 'exactly these eight lines')
+                      .replace('exactly these five lines', 'exactly these six lines')
+                      + _BOX_LINE + _SYSTEM_PROMPT[_at:])
 
 
-# Crop first (the default): every photo is first read cut to its display, the box asked in
-# a request of its own; FOTOMATES_CROP_FIRST=0 reads the whole photo first, as before.
-CROP_FIRST = os.environ.get('FOTOMATES_CROP_FIRST', '1').strip() not in ('0', 'false', 'no', 'off', '')
+def system_prompt(crop: bool = False) -> str:
+    """The system prompt of a read: with the BOX line for a whole photo when REREAD_MODE is crop."""
+    return _BOX_SYSTEM_PROMPT if REREAD_MODE == 'crop' and not crop else _SYSTEM_PROMPT
+
+
 BOX_PROMPT = ('Locate the meter\'s register display: the LCD/LED screen or the window of number wheels that '
               'shows the consumption. Answer only with JSON: {"bbox_2d": [x1, y1, x2, y2]}')
+if PROMPT == 'v3':  # a tight box can cut the small last cell off
+    BOX_PROMPT = _swap(BOX_PROMPT, 'shows the consumption.',
+                       'shows the consumption, including any smaller decimal cell at the right end of the row.')
 
 
 def parse_box(text):
@@ -869,9 +987,21 @@ def extract_box(text: str) -> tuple | None:
     return tuple(float(n) for n in numbers[:4]) if len(numbers) >= 4 else None
 
 
-def crop_rect(box, width: int, height: int):
-    """The pixels (x1, y1, x2, y2) of the photo to cut for box (0-1000), with CROP_MARGIN
-    and clipped to the photo, and None; or None and why the box is not used."""
+def box_turned(box, width: int, height: int) -> bool:
+    """With FOTOMATES_ROTATED: the box (0-1000) is taller than wide in pixels and its
+    height / width is within BOX_ASPECT, the shape of a display photographed sideways."""
+    if not ROTATED or box is None:
+        return False
+    x1, y1, x2, y2 = box
+    if not (0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000):
+        return False
+    tall = (y2 - y1) * height / ((x2 - x1) * width)
+    return BOX_ASPECT[0] <= tall <= BOX_ASPECT[1]
+
+
+def crop_rect(box, width: int, height: int, margin: float | None = None):
+    """The pixels (x1, y1, x2, y2) of the photo to cut for box (0-1000), with margin (by
+    default CROP_MARGIN) and clipped to the photo, and None; or None and why the box is not used."""
     if box is None:
         return None, 'no box'
     x1, y1, x2, y2 = box
@@ -879,20 +1009,26 @@ def crop_rect(box, width: int, height: int):
         return None, 'box outside the photo'
     share_w, share_h = (x2 - x1) / 1000, (y2 - y1) / 1000
     aspect = share_w * width / (share_h * height)
-    if not BOX_WIDTH[0] <= share_w <= BOX_WIDTH[1]:
-        return None, f'box width {100 * share_w:.0f}%'
-    if not BOX_HEIGHT[0] <= share_h <= BOX_HEIGHT[1]:
-        return None, f'box height {100 * share_h:.0f}%'
-    if not BOX_ASPECT[0] <= aspect <= BOX_ASPECT[1]:
-        return None, f'box aspect {aspect:.2f}'
+    if box_turned(box, width, height):  # a display on its side: its long side runs down the photo
+        if not BOX_WIDTH[0] <= share_h <= BOX_WIDTH[1]:
+            return None, f'box height {100 * share_h:.0f}%'
+        if not BOX_HEIGHT[0] <= share_w <= BOX_HEIGHT[1]:
+            return None, f'box width {100 * share_w:.0f}%'
+    else:
+        if not BOX_WIDTH[0] <= share_w <= BOX_WIDTH[1]:
+            return None, f'box width {100 * share_w:.0f}%'
+        if not BOX_HEIGHT[0] <= share_h <= BOX_HEIGHT[1]:
+            return None, f'box height {100 * share_h:.0f}%'
+        if not BOX_ASPECT[0] <= aspect <= BOX_ASPECT[1]:
+            return None, f'box aspect {aspect:.2f}'
     px1, py1, px2, py2 = x1 / 1000 * width, y1 / 1000 * height, x2 / 1000 * width, y2 / 1000 * height
-    margin = CROP_MARGIN * max(px2 - px1, py2 - py1)
+    margin = (CROP_MARGIN if margin is None else margin) * max(px2 - px1, py2 - py1)
     return (max(0, int(px1 - margin)), max(0, int(py1 - margin)),
             min(width, int(round(px2 + margin))), min(height, int(round(py2 + margin)))), None
 
 
 def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: float = 1.0,
-                 crop: bool = False, box=None) -> OcrResult:
+                 crop: bool = False, box=None, margin: float | None = None) -> OcrResult:
     steps = []
     aids = []
     server = []
@@ -930,7 +1066,7 @@ def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: flo
 
     try:
         content, choice, report, readings = _read_photo(image_path, timed, aids, server, model_seconds, choice,
-                                                        scale, crop, box)
+                                                        scale, crop, box, margin)
     except Exception as error:
         reason = _failure_reason(error)
         raise OcrFailure(reason, breakdown(*server, 'FAILED: ' + reason)) from error
@@ -966,19 +1102,24 @@ def _request_ocr(image_path: Path, choice: Backend = DEFAULT_BACKEND, scale: flo
 
 
 def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds: list,
-                backend_choice: Backend = DEFAULT_BACKEND, scale: float = 1.0, crop: bool = False, box=None):
+                backend_choice: Backend = DEFAULT_BACKEND, scale: float = 1.0, crop: bool = False, box=None,
+                margin: float | None = None, turn: int = 90):
     # The photo is decoded to judge it: whether it is too small or needs enhancing.
     report = dict(blur_variance=0.0)
     needs = []
     original = timed('decode image', lambda: decode_image(image_path))
     size = dict(width=int(original.shape[1]), height=int(original.shape[0]))
-    cropped = False
+    cropped = skipped = turned = False
     if crop:  # the re-read of a crop: cut the box from the original photo, then enlarge it
-        rect, why = crop_rect(box, size['width'], size['height'])
+        rect, why = crop_rect(box, size['width'], size['height'], margin)
         if rect:
             x1, y1, x2, y2 = rect
             original = original[y1:y2, x1:x2]
-            scale = max(CROP_WIDTH / (x2 - x1), _MIN_SIDE / min(x2 - x1, y2 - y1))
+            turned = box_turned(box, size['width'], size['height'])
+            if turned:  # a display on its side: turned upright, clockwise first (turn 90)
+                original = cv2.rotate(original, cv2.ROTATE_90_CLOCKWISE if turn == 90
+                                      else cv2.ROTATE_90_COUNTERCLOCKWISE)
+            scale = max(CROP_WIDTH / original.shape[1], _MIN_SIDE / min(original.shape[:2]))
             cropped = True
         else:
             aids.append(f'crop-fallback({why})')  # the whole frame, enlarged by scale, instead
@@ -993,17 +1134,22 @@ def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds
         report = timed('assess quality', lambda: assess(original))
         if _ENHANCE_MODE == 'always':
             needs = ['always']
-        elif _ENHANCE_MODE == 'auto':
+        elif _ENHANCE_MODE == 'auto' or (_ENHANCE_MODE == 'whole' and not cropped):
             needs = [flag for flag in _ENHANCE_WHEN if report.get(flag)]
+            if needs and report.get('is_dark') and report.get('contrast', 255.0) < BLANK_MAX:
+                needs = []  # a black cut: brightening it only turns noise into shapes
+                skipped = True
     if needs or enlarged or cropped:
         photo = timed('enhance photo', lambda: enhance(original, report)) if needs else original
         encoded = timed('encode png + base64', lambda: png_data_url(photo))
         if cropped:
-            aids.append(f'crop({scale:.3g}x)')
+            aids.append(f'crop({scale:.3g}x,rot{turn})' if turned else f'crop({scale:.3g}x)')
         elif enlarged:
             aids.append(f'enlarged({scale:g}x)')
         if needs:
             aids.append('enhanced(' + ','.join(needs) + ')')
+        elif skipped:
+            aids.append('enhance-skipped(black)')
     else:
         encoded = timed('read photo file', lambda: photo_data_url(image_path))
         aids.append('original')
@@ -1011,7 +1157,8 @@ def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds
     report = dict(report, **size, sent_image=encoded if needs or enlarged else None)
 
     images = [
-        {"type": "text", "text": "Meter photo."},
+        *_FEWSHOTS,  # FOTOMATES_FEWSHOT: example photos with their CELLS line, else nothing
+        {"type": "text", "text": "The meter photo to read:" if _FEWSHOTS else "Meter photo."},
         {"type": "image_url", "image_url": {"url": encoded}},
     ]
 
@@ -1048,10 +1195,30 @@ def _read_photo(image_path: Path, timed, aids: list, server: list, model_seconds
                 timings.get('predicted_ms', 0) / 1000))
         return response.choices[0]
 
-    choice = timed('model request', lambda: read(_SYSTEM_PROMPT))
+    choice = timed('model request', lambda: read(system_prompt(crop)))
     content = choice.message.content or ''
     readings = [timed('extract reading', lambda: extract_reading(content))]
+    if turned and turn == 90 and (not readings[0] or extract_device_type(content) is None):
+        # Nothing read: the display may be on its other side. Read once more turned the other
+        # way and keep that read when it has digits.
+        other_aids = []
+        other = _read_photo(image_path, timed, other_aids, server, model_seconds, backend_choice,
+                            scale, crop, box, margin, turn=270)
+        if other[3][0]:
+            aids[:] = other_aids
+            return other
     return content, choice, report, readings
+
+
+def settings_note() -> str:
+    """The settings of Round 2 that are not at their default, for a run's first log line."""
+    from detect_quality import ENHANCER
+    notes = [f'enhance {_ENHANCE_MODE}' if _ENHANCE_MODE != 'auto' else '',
+             f'enhancer {ENHANCER}' if ENHANCER != 'light' else '',
+             'rotated boxes accepted' if ROTATED else '',
+             'repeated-digit line' if REPEAT_HINT else '',
+             f'{len(_FEWSHOTS) // 3} example photos' if _FEWSHOTS else '']
+    return ''.join('; ' + note for note in notes if note)
 
 
 def warm_up() -> None:
@@ -1066,11 +1233,11 @@ def warm_up() -> None:
 
 
 def ocr_image(image_path: Path, model: str | None = None, scale: float = 1.0,
-              crop: bool = False, box=None) -> OcrResult:
-    """Read a photo. crop: read the box (0-1000, from the first read's BOX line) cut from
-    the photo; when the box is missing or does not look like a display, the whole photo
-    enlarged by scale, labelled crop-fallback."""
-    return _request_ocr(Path(image_path), backend(model), scale, crop, box)
+              crop: bool = False, box=None, margin: float | None = None) -> OcrResult:
+    """Read a photo. crop: read the box (0-1000, from the box request or a whole-photo read's
+    BOX line) cut from the photo with margin (by default CROP_MARGIN); when the box is missing
+    or does not look like a display, the whole photo enlarged by scale, labelled crop-fallback."""
+    return _request_ocr(Path(image_path), backend(model), scale, crop, box, margin)
 
 
 

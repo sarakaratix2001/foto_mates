@@ -15,6 +15,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py web_index.html ./
+COPY fewshot ./fewshot
 
 
 ENV FOTOMATES_RUNS=/data/web_runs \

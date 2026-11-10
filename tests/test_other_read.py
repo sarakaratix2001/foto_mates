@@ -20,6 +20,17 @@ from audit_readings import (COLUMNS, _saved_match, connect, read_best, read_deta
                             split_decimals, summary)
 
 
+_ENLARGE = mock.patch.object(audit_readings, 'REREAD_MODE', 'enlarge')  # here the read after the whole photo is the 3x one
+
+
+def setUpModule():
+    _ENLARGE.start()
+
+
+def tearDownModule():
+    _ENLARGE.stop()
+
+
 def read(cells, score, scale, text):
     result = NS(text=text, reading_seconds=1.0, digit_confidence=[0.9] * len(cells), digit_alternatives=[],
                 image_report={}, device_type='digital', code_confidence=[], evidence_source='original')
@@ -29,9 +40,10 @@ def read(cells, score, scale, text):
 
 class OtherReadTest(unittest.TestCase):
     def setUp(self):  # the whole photo first: the crop-first order is tested in test_crop_first
-        patcher = mock.patch.object(audit_readings, 'CROP_FIRST', False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for name, value in (('CROP_FIRST', False), ('blank_photo', lambda path: None)):  # no photo file here
+            patcher = mock.patch.object(audit_readings, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def reads(self, first, second):
         return mock.patch.object(audit_readings, 'read_scored',

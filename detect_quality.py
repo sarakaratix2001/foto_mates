@@ -156,15 +156,16 @@ def enhance_for_ocr(
 
 # Which correction enhance() applies: 'light' sets brightness and contrast from
 # the photo's own light and keeps colour (adjust_light); 'gmm' is the grayscale
-# denoise / glare inpaint / contrast / sharpen chain (enhance_for_ocr).
+# denoise / glare inpaint / contrast / sharpen chain (enhance_for_ocr); 'glare-gmm' is
+# gmm for a photo flagged has_glare (the chain paints over the glare) and light for the rest.
 ENHANCER = os.environ.get('FOTOMATES_ENHANCER', 'light').strip().lower()
-if ENHANCER not in ('light', 'gmm'):
-    raise ValueError(f"FOTOMATES_ENHANCER must be 'light' or 'gmm', not {ENHANCER!r}")
+if ENHANCER not in ('light', 'gmm', 'glare-gmm'):
+    raise ValueError(f"FOTOMATES_ENHANCER must be 'light', 'gmm' or 'glare-gmm', not {ENHANCER!r}")
 
 
 def enhance(bgr: np.ndarray, report: dict | None = None) -> np.ndarray:
     """The photo corrected by the chosen ENHANCER."""
-    if ENHANCER == 'gmm':
+    if ENHANCER == 'gmm' or (ENHANCER == 'glare-gmm' and (report or {}).get('has_glare')):
         return enhance_for_ocr(bgr, report)
     return adjust_light(bgr)
 

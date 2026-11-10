@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from evaluation import GROUPS as EVALUATION_GROUPS, evaluate, lines as evaluation_lines
-from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, PROMPT, CROP_FIRST, REREAD_MODE, RETAKE_SCORE, extract_box, find_box, image_workers, photo_bytes, PhotoFileError, photo_retake_reason, _reading_digits, ocr_image,
+from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, PROMPT, CROP_FIRST, REREAD_MODE, RETAKE_SCORE, THIRD_MARGIN, blank_photo, extract_box, settings_note, find_box, image_workers, photo_bytes, PhotoFileError, photo_retake_reason, _reading_digits, ocr_image,
                               server_slots, extract_blank, extract_no_meter, low_score_reasons, score_reading)
 
 AUDIT_DB = Path(__file__).resolve().parent / os.environ.get('FOTOMATES_AUDIT_DB', 'audit_readings.sqlite3')
@@ -75,7 +75,16 @@ DETAIL_COLUMNS = (
     ('other_reading', 'TEXT'),          # the read not kept, its digits as read (zeros kept); NULL for one read
     ('other_score', 'REAL'),            # its score
     ('other_scale', 'TEXT'),            # how it was read: 1 (as the photo is) or 3 (enlarged 3x)
-    ('reads_agree', 'INTEGER'),         # 1: both reads gave the same digits, 0: they differ, NULL: one read
+    ('reads_agree', 'INTEGER'),         # 1: every read made gave the same digits, 0: any two differ, NULL: one read
+    # Every read made, by what it was: crop (the display cut out), whole (the whole photo),
+    # third (the read after an unsure whole photo). Empty when that read was not made.
+    *((f'{read}_{field}', kind) for read in ('crop', 'whole', 'third')
+      for field, kind in (('digits', 'TEXT'),          # as read: leading zeros and decimals kept
+                          ('probabilities', 'TEXT'),   # one per digit, as digit_probabilities
+                          ('score', 'REAL'),
+                          ('sent', 'TEXT'))),          # that read's photo_sent label
+    ('box_answer', 'TEXT'),             # the box finder's own answer
+    ('box_reason', 'TEXT'),             # why no crop was read from it (box aspect 0.61, ...); NULL: it was used
     ('photo_sent', 'TEXT'),             # what the model saw: original / enlarged(2x) / enhanced(is_dark,...)
     ('image_width', 'INTEGER'),         # the photo as stored, in pixels
     ('image_height', 'INTEGER'),
@@ -336,22 +345,43 @@ def record_retry_failure(filename, row):
 REREAD_BELOW = float(os.environ.get('FOTOMATES_REREAD_BELOW', '0.7'))
 # Every small photo is already read enlarged to FOTOMATES_MIN_SIDE (2x for 240x400), so the reread goes further.
 REREAD_SCALE = float(os.environ.get('FOTOMATES_REREAD_SCALE', '3'))
+# Which read of a photo is kept (crop first only). score: the crop alone at REREAD_BELOW or more,
+# else the highest score of the reads made. agree: the crop and the whole photo are both read
+# for every photo; the same digits keep the crop, different digits get a third read and the
+# digits two reads share are kept; with no two alike the highest score is kept, its score
+# capped at DISAGREE_SCORE (under REREAD_BELOW: the reads did not settle it).
+KEEP = os.environ.get('FOTOMATES_KEEP', 'score').strip().lower()
+if KEEP not in ('score', 'agree'):
+    raise SystemExit(f'FOTOMATES_KEEP must be score or agree, not {KEEP!r}')
+DISAGREE_SCORE = float(os.environ.get('FOTOMATES_DISAGREE_SCORE', '0.69'))
+
+
+def _third_how():
+    """How the read after the whole photo is made, in words."""
+    if REREAD_MODE != 'crop':
+        return f'at {REREAD_SCALE:g}x'
+    if not CROP_FIRST:
+        return f'from a crop ({REREAD_SCALE:g}x without a usable box)'
+    return (f"from a crop of the whole-photo read's own box, margin {THIRD_MARGIN:g} "
+            f'({REREAD_SCALE:g}x without a usable box)')
 
 
 def reread_rule():
     """The re-read rule in words, for the log: 'reread below 0.7 at 3x' or 'reread off'."""
     crop = f'crop first, kept at {REREAD_BELOW:g} or more, else the whole photo; ' if CROP_FIRST else ''
+    if CROP_FIRST and KEEP == 'agree':
+        third = 'no third read' if REREAD_SCALE == 1 else 'a third read ' + _third_how()
+        return (f'crop and whole photo both read; the same digits keep the crop; different digits: {third}, '
+                f'the digits two reads share kept, else the highest score capped at {DISAGREE_SCORE:g}')
     if REREAD_SCALE == 1:
         return crop + 'reread off'
-    how = (f'from a crop ({REREAD_SCALE:g}x without a usable box)' if REREAD_MODE == 'crop' and not CROP_FIRST
-           else f'at {REREAD_SCALE:g}x')
-    return crop + f'reread below {REREAD_BELOW:g} {how}' + ('; the most confident read kept' if CROP_FIRST else '')
+    return crop + f'reread below {REREAD_BELOW:g} {_third_how()}' + ('; the most confident read kept' if CROP_FIRST else '')
 
 
-def read_scored(path, saved, model=None, scale=1.0, crop=False, box=None):
+def read_scored(path, saved, model=None, scale=1.0, crop=False, box=None, margin=None):
     """One read of a photo with its consumption and its one score. 'scale' says how it was
     read: 1.0 as it is, 3.0 enlarged, or the crop's label, e.g. 'crop(2.71x)'."""
-    result = ocr_image(path, model=model, scale=scale, crop=crop, box=box)
+    result = ocr_image(path, model=model, scale=scale, crop=crop, box=box, **({} if margin is None else {'margin': margin}))
     label = re.search(r'crop\([^)]*\)', result.evidence_source or '') if crop else None
     scale = label[0] if label else scale
     cells = _reading_digits(result.text) or ''
@@ -373,21 +403,31 @@ def read_best(path, saved, model=None):
     value never decides which read is kept. Adds 'reread' (more than one read made),
     'seconds' (model time of every request made), and, after two reads or more, 'other' (the
     best read not kept) and 'others' (every read not kept)."""
+    black = _black_frame(path)
+    if black is not None:  # nothing to find or read: no box request, no read, no brightening
+        whole, decimals, match = split_decimals(None, saved, None)
+        return dict(result=black, cells='', whole=whole, decimals=decimals, match=match, parts=None, score=None,
+                    scale=1.0, reread=False, seconds=0.0, reads=[])
     if not CROP_FIRST:
         return _read_whole(path, saved, model)
-    crop, box, seconds = None, None, 0.0
+    crop, box, seconds, box_reason = None, None, 0.0, None
     try:
         box = find_box(path, model)
         seconds += box['seconds']
+        box_reason = box.get('why')
         if box['box']:
-            crop = read_scored(path, saved, model, crop=True, box=box['box'])
+            crop = dict(read_scored(path, saved, model, crop=True, box=box['box']), role='crop')
             seconds += crop['result'].reading_seconds or 0.0
     except Exception as exc:
         if _file_error(exc) is not None:
             raise  # the share is gone: read_with_retries waits for it
         crop = None  # the box or the crop could not be read: the whole photo is read
+        box_reason = (('crop read' if box else 'box request') + f' failed: {type(exc).__name__}: {exc}')[:200]
+    if crop and KEEP == 'agree':
+        return _keep_agreed(path, saved, model, crop, seconds, box, box_reason)
     if crop and crop['score'] is not None and crop['score'] >= REREAD_BELOW:
-        return dict(crop, reread=False, seconds=seconds, box_answer=box['answer'])
+        return dict(crop, reread=False, seconds=seconds, box_answer=box['answer'], box_reason=box_reason,
+                    reads=[crop])
     whole = _read_whole(path, saved, model, unsure=lambda score: max(
         score if score is not None else -1, crop['score'] if crop and crop['score'] is not None else -1) < REREAD_BELOW)
     reads = [crop] if crop else []
@@ -397,7 +437,75 @@ def read_best(path, saved, model=None):
     others = sorted((r for r in reads if r is not best), key=lambda r: r['score'] if r['score'] is not None else -1,
                     reverse=True)
     return dict(best, reread=len(reads) > 1, seconds=seconds + whole['seconds'], other=others[0] if others else None,
-                others=others, box_answer=box['answer'] if box else None)
+                others=others, box_answer=box['answer'] if box else None, box_reason=box_reason, reads=reads)
+
+
+def _keep_agreed(path, saved, model, crop, seconds, box, box_reason):
+    """FOTOMATES_KEEP=agree, after the crop read: the whole photo is read too. A read without
+    digits takes no part. The same digits: the crop is kept. Different digits: a third read,
+    and the digits two reads share are kept (the crop when it is one of the two, else the
+    higher score of the two). No two alike: the highest score, capped at DISAGREE_SCORE.
+    Only one read with digits: as the score rule, it is read once more when unsure."""
+    def points(read):
+        return read['score'] if read['score'] is not None else -1
+
+    def same(digits):
+        return [read for read in reads if read['cells'] == digits]
+
+    whole = read_scored(path, saved, model)
+    whole['role'] = 'whole'
+    reads = [crop, whole]
+    said = [read for read in reads if read['cells']]
+    if len(said) == 2:
+        again = crop['cells'] != whole['cells']
+    else:  # nothing to compare: the third read is made as under the score rule
+        again = max(map(points, reads)) < REREAD_BELOW and not extract_no_meter(whole['result'].text)
+    if again:
+        third = _third_read(path, saved, model, whole)
+        reads += [third] if third else []
+        said = [read for read in reads if read['cells']]
+    shared = [read for read in said if len(same(read['cells'])) > 1]
+    if shared:
+        best = crop if crop in shared else max(shared, key=points)  # a tie keeps the earlier read
+    else:
+        best = max(reads, key=points)
+    others = sorted((read for read in reads if read is not best), key=points, reverse=True)
+    kept = dict(best, reread=True, seconds=seconds + sum(r['result'].reading_seconds or 0.0 for r in reads[1:]),
+                other=others[0], others=others, box_answer=box['answer'], box_reason=box_reason, reads=reads)
+    if not shared and len({read['cells'] for read in said}) > 1 and kept['score'] is not None:
+        kept['score'] = min(kept['score'], DISAGREE_SCORE)  # each read's own score stays in its columns
+    return kept
+
+
+def _third_read(path, saved, model, first):
+    """The read after the whole photo (first): enlarged, or cut to the box the whole-photo read
+    gave (REREAD_MODE crop). None when it is off or fails; a failure is written on first."""
+    if REREAD_SCALE == 1:
+        return None
+    try:
+        if REREAD_MODE == 'crop':  # the box the first read gave; without a usable one, the 3x frame
+            second = read_scored(path, saved, model, REREAD_SCALE, crop=True,
+                                 box=extract_box(first['result'].text),
+                                 margin=THIRD_MARGIN if CROP_FIRST else None)  # a wider cut than the first crop
+        else:
+            second = read_scored(path, saved, model, REREAD_SCALE)
+    except Exception as exc:
+        if _file_error(exc) is not None:
+            raise  # the share is gone: read_with_retries waits for it
+        first['result'].evidence_source = (first['result'].evidence_source or '') + '+reread-failed'
+        return None
+    return dict(second, role='third')
+
+
+def _black_frame(path):
+    """blank_photo's result for a black frame, else None. A photo that cannot be judged is
+    read as usual; a file the share does not give is raised, for read_with_retries."""
+    try:
+        return blank_photo(path)
+    except Exception as exc:
+        if _file_error(exc) is not None:
+            raise
+        return None
 
 
 def _read_whole(path, saved, model=None, unsure=None):
@@ -405,7 +513,8 @@ def _read_whole(path, saved, model=None, unsure=None):
     REREAD_BELOW); the read with the higher score is kept, the other in 'other'."""
     unsure = unsure or (lambda score: score is None or score < REREAD_BELOW)
     first = read_scored(path, saved, model)
-    first.update(reread=False, seconds=first['result'].reading_seconds or 0.0)
+    first.update(reread=False, seconds=first['result'].reading_seconds or 0.0, role='whole')
+    first['reads'] = [first]
     if REREAD_SCALE == 1:
         return first  # no resizing: the same image read again gives the same answer (temperature 0)
     if not unsure(first['score']):
@@ -415,23 +524,44 @@ def _read_whole(path, saved, model=None, unsure=None):
     try:
         if REREAD_MODE == 'crop':  # the box the first read gave; without a usable one, the 3x frame
             second = read_scored(path, saved, model, REREAD_SCALE, crop=True,
-                                 box=extract_box(first['result'].text))
+                                 box=extract_box(first['result'].text),
+                                 margin=THIRD_MARGIN if CROP_FIRST else None)  # a wider cut than the first crop
         else:
             second = read_scored(path, saved, model, REREAD_SCALE)
     except Exception:
-        return first  # the first read stands when the second fails
+        # the first read stands when the second fails, and says so
+        first['result'].evidence_source = (first['result'].evidence_source or '') + '+reread-failed'
+        return first
+    second = dict(second, role='third')
     seconds = (first['result'].reading_seconds or 0.0) + (second['result'].reading_seconds or 0.0)
     best, other = (second, first) if (second['score'] or -1) > (first['score'] or -1) else (first, second)
-    return dict(best, reread=True, seconds=seconds, other=other)
+    return dict(best, reread=True, seconds=seconds, other=other, reads=[first, second])
 
 
-def read_details(result, reading, reread, other=None, other_reads=None, box_answer=None):
+def read_details(result, reading, reread, other=None, other_reads=None, box_answer=None, reads=None,
+                 box_reason=None):
     """What a read knows beyond the reading: per-digit probabilities and second choices,
     the register code cut off, the model's answer and what it was shown, and, after two
     reads, the read not kept (other, from read_best): its digits, score and scale, whether
-    both gave the same digits, and its answer after the kept one's."""
+    the reads gave the same digits, and its answer after the kept one's. reads (from
+    read_best) is every read made, each with its role: crop, whole or third."""
     def numbers(values):
         return ' '.join(f'{p:.3f}' for p in values) if values else None
+    each = {}
+    for one in reads or []:
+        role, digits = one.get('role'), one.get('cells') or None
+        if role not in ('crop', 'whole', 'third'):
+            continue
+        chances = list(getattr(one['result'], 'digit_confidence', None) or [])
+        each.update({f'{role}_digits': digits,
+                     f'{role}_probabilities': numbers(chances) if digits and len(chances) == len(digits) else None,
+                     f'{role}_score': one.get('score'),
+                     f'{role}_sent': getattr(one['result'], 'evidence_source', None)})
+    made = [one['cells'] for one in reads or [] if one.get('cells')]  # a read without digits takes no part
+    if reads is not None:
+        agree = int(len(set(made)) == 1) if len(made) > 1 else None
+    else:
+        agree = int((reading or '') == other['cells']) if other else None
     probabilities = list(result.digit_confidence or [])
     aligned = reading is not None and len(probabilities) == len(reading)
     second = []
@@ -457,7 +587,7 @@ def read_details(result, reading, reread, other=None, other_reads=None, box_answ
         other_reading=(other['cells'] or None) if other else None,
         other_score=other['score'] if other else None,
         other_scale=_scale_label(other['scale']) if other else None,
-        reads_agree=int((reading or '') == other['cells']) if other else None,
+        reads_agree=agree, **each, box_answer=box_answer, box_reason=box_reason,
         model_answer=result.text + ''.join(f"\n--- other read ({_scale_label(o['scale'])}) ---\n{o['result'].text}"
                                            for o in (other_reads if other_reads is not None else [other] if other else []))
         + (f"\n--- box (own request) ---\n{box_answer}" if box_answer else ''))
@@ -618,7 +748,7 @@ def read_one(path, month, model=None):
     if not reason and score is not None and score < RETAKE_SCORE:
         reason = low_score_reasons(read['parts'])[0] if read['parts'] else 'the overall confidence is low'
     details = read_details(result, reading, read.get('reread'), read.get('other'), read.get('others'),
-                           read.get('box_answer'))
+                           read.get('box_answer'), read.get('reads'), read.get('box_reason'))
     too_long = bool(read['parts'] and read['parts'].get('too_long'))
     return dict(row, **details, model=model_backend(model).model, picture_name=path.name, extracted_reading=reading,
                 extracted_whole=whole, extracted_decimals=decimals, match=match,
@@ -650,7 +780,7 @@ def command_read(args):
     slots = server_slots(choice.servers)
     workers = args.workers or image_workers(choice, slots)
     print(f'reading with {workers} worker(s) into {args.db}; model {choice.label}; model server slots: '
-          f'{slots or "not reported"}; prompt {PROMPT}; {reread_rule()}', flush=True)
+          f'{slots or "not reported"}; prompt {PROMPT}; {reread_rule()}{settings_note()}', flush=True)
     started = time.monotonic()
     count = matched = failed = rejected = codes = too_long = 0
     failed_now = {}  # picture name -> path of the photos saved as an error in this run

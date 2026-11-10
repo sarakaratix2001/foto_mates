@@ -20,6 +20,17 @@ from audit_readings import read_best, read_details  # noqa: E402
 PHOTO = Path('AL0010556_20261023092021_JURGENDU_1111__ExpAktiv_41-33_19-82.jpg')
 
 
+_ENLARGE = mock.patch.object(audit_readings, 'REREAD_MODE', 'enlarge')  # here the read after the whole photo is the 3x one
+
+
+def setUpModule():
+    _ENLARGE.start()
+
+
+def tearDownModule():
+    _ENLARGE.stop()
+
+
 def read(cells, score, scale):
     result = NS(text=f'READING: {cells}', reading_seconds=1.0, digit_confidence=[0.9] * len(cells),
                 digit_alternatives=[{d: 0.9, '7': 0.1} for d in cells], image_report={}, device_type='digital',
@@ -39,6 +50,7 @@ class CropFirstTest(unittest.TestCase):
 
         found = dict(box=box, why=None if box else 'no box', answer='{"bbox_2d": [100, 300, 900, 500]}', seconds=0.5)
         with mock.patch.object(audit_readings, 'CROP_FIRST', True), \
+                mock.patch.object(audit_readings, 'blank_photo', return_value=None), \
                 mock.patch.object(audit_readings, 'REREAD_SCALE', reread_scale), \
                 mock.patch.object(audit_readings, 'find_box', return_value=found), \
                 mock.patch.object(audit_readings, 'read_scored', side_effect=scored):
@@ -87,6 +99,7 @@ class CropFirstTest(unittest.TestCase):
 
     def test_box_request_fails_reads_the_whole_photo(self):
         with mock.patch.object(audit_readings, 'CROP_FIRST', True), \
+                mock.patch.object(audit_readings, 'blank_photo', return_value=None), \
                 mock.patch.object(audit_readings, 'find_box', side_effect=RuntimeError('model gone')), \
                 mock.patch.object(audit_readings, 'read_scored', return_value=read('01111', 0.9, 1.0)):
             self.assertEqual(read_best(PHOTO, '1111')['cells'], '01111')
