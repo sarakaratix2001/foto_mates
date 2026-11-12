@@ -20,3 +20,7 @@ foto mates/
 recovery/
 ground_truth_data/*
 !ground_truth_data/README.md
+
+# Few-shot example crops: customer meter photos (the team's copy stays on the server)
+fewshot/*.png
+fewshot/*.jpg

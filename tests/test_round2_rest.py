@@ -165,7 +165,10 @@ class ExamplesTest(unittest.TestCase):  # Tasks 15 and 16
         self.assertEqual(len(parts) % 3, 0)
         self.assertIn(len(parts) // 3, (3, 4))
         self.assertEqual([part['type'] for part in parts[:3]], ['text', 'image_url', 'text'])
-        self.assertEqual(parts[2]['text'], 'CELLS: 0 0 7 3 7 9 5 5 5')
+        import csv
+        with open(folder / 'examples.csv', encoding='utf-8-sig', newline='') as file:
+            first = next(csv.DictReader(file))['cells']
+        self.assertEqual(parts[2]['text'], 'CELLS: ' + ' '.join(first))
         self.assertTrue(parts[1]['image_url']['url'].startswith('data:image/png;base64,'))
 
     def test_a_missing_list_or_photo_is_an_error(self):
@@ -183,13 +186,21 @@ class ExamplesTest(unittest.TestCase):  # Tasks 15 and 16
         shots = [{'type': 'text', 'text': 'Example 1 (another meter, already read):'},
                  {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,e'}},
                  {'type': 'text', 'text': 'CELLS: 1 2 3'}]
-        seen, _ = send(_FEWSHOTS=shots)
+        seen, _ = send(_FEWSHOTS=shots, FEWSHOT_ON='all')
         parts = seen['messages'][1]['content']
         self.assertEqual(parts[1:4], shots)
         self.assertEqual(parts[4]['text'], 'The meter photo to read:')
         self.assertEqual((len(parts), parts[5]['type']), (6, 'image_url'))
         seen, _ = send()
         self.assertEqual([part.get('text') for part in seen['messages'][1]['content'][1:]], ['Meter photo.', None])
+
+    def test_by_default_only_the_third_read_gets_them(self):  # Task 10
+        shots = [{'type': 'text', 'text': 'CELLS: 1 2 3'}]
+        seen, _ = send(_FEWSHOTS=shots, FEWSHOT_ON='third')
+        self.assertNotIn(shots[0], seen['messages'][1]['content'])
+        with extract_readings.third_read():
+            seen, _ = send(_FEWSHOTS=shots, FEWSHOT_ON='third')
+        self.assertIn(shots[0], seen['messages'][1]['content'])
 
 
 class EnhancerTest(unittest.TestCase):  # Task 16
@@ -220,7 +231,7 @@ class SettingsNoteTest(unittest.TestCase):
         with mock.patch.multiple(extract_readings, _ENHANCE_MODE='whole', ROTATED=True, REPEAT_HINT=True,
                                  _FEWSHOTS=[{}] * 12), mock.patch.object(detect_quality, 'ENHANCER', 'glare-gmm'):
             self.assertEqual(settings_note(), '; enhance whole; enhancer glare-gmm; rotated boxes accepted; '
-                                              'repeated-digit line; 4 example photos')
+                                              'repeated-digit line; 4 example photos on third reads')
 
 
 if __name__ == '__main__':

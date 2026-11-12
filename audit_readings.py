@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 import os
 from pathlib import Path
@@ -16,7 +17,9 @@ import threading
 import time
 from evaluation import GROUPS as EVALUATION_GROUPS, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, backend as model_backend, OCR_MODEL, PHOTO_TYPES, PROMPT, CROP_FIRST, REREAD_MODE, RETAKE_SCORE, THIRD_MARGIN, blank_photo, extract_box, settings_note, find_box, image_workers, photo_bytes, PhotoFileError, photo_retake_reason, _reading_digits, ocr_image,
-                              server_slots, extract_blank, extract_no_meter, low_score_reasons, score_reading)
+                              server_slots, extract_blank, extract_no_meter, low_score_reasons, score_reading,
+                              NOT_A_REGISTER, extract_off, extract_source, parse_box, photo_stats, start_photo_stats,
+                              third_read)
 
 AUDIT_DB = Path(__file__).resolve().parent / os.environ.get('FOTOMATES_AUDIT_DB', 'audit_readings.sqlite3')
 BATCH_LOOKUP = 900  # below SQLite's limit of host parameters per statement
@@ -40,7 +43,7 @@ CREATE TABLE IF NOT EXISTS readings (
     extracted_whole   TEXT,     -- the consumption read: no leading zeros, decimals stripped
     extracted_decimals INTEGER, -- how many digits were stripped as decimals
     match             TEXT NOT NULL,  -- yes / no
-    status            TEXT NOT NULL,  -- done / missing / no_meter / blank / no_saved_reading / error
+    status            TEXT NOT NULL,  -- done / missing / no_meter / blank / off / no_saved_reading / error
     score             REAL,
     retake            INTEGER,
     seconds           REAL,
@@ -53,6 +56,16 @@ CREATE TABLE IF NOT EXISTS readings (
 ) WITHOUT ROWID;  -- the rows live in the picture_name index itself: one copy, smaller file
 CREATE INDEX IF NOT EXISTS readings_month ON readings(month, status, match);
 CREATE INDEX IF NOT EXISTS readings_contract ON readings(contract_id, month, register);
+-- FOTOMATES_CELL_HISTORY: the cell count of every confident AI read (score 0.9 or more), never
+-- the reader's saved value; a later photo of the same contract and register is checked against it.
+CREATE TABLE IF NOT EXISTS cell_counts (
+    picture_name TEXT PRIMARY KEY,
+    contract_id  TEXT NOT NULL,
+    register     TEXT,
+    date         TEXT,
+    cells        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cell_counts_contract ON cell_counts(contract_id, register, date);
 """
 
 # Everything else known about a read, kept so a result can be checked or a rule applied
@@ -78,7 +91,7 @@ DETAIL_COLUMNS = (
     ('reads_agree', 'INTEGER'),         # 1: every read made gave the same digits, 0: any two differ, NULL: one read
     # Every read made, by what it was: crop (the display cut out), whole (the whole photo),
     # third (the read after an unsure whole photo). Empty when that read was not made.
-    *((f'{read}_{field}', kind) for read in ('crop', 'whole', 'third')
+    *((f'{read}_{field}', kind) for read in ('crop', 'whole', 'third', 'hint')
       for field, kind in (('digits', 'TEXT'),          # as read: leading zeros and decimals kept
                           ('probabilities', 'TEXT'),   # one per digit, as digit_probabilities
                           ('score', 'REAL'),
@@ -94,6 +107,18 @@ DETAIL_COLUMNS = (
     ('glare_fraction', 'REAL'),
     ('image_flags', 'TEXT'),            # is_blurry, is_dark, has_glare, ... that were true
     ('model_answer', 'TEXT'),           # the model's whole answer, with the timing lines after it
+    ('source', 'TEXT'),                 # SOURCE (prompt v3/v4): LCD, LED, WHEELS, HANDWRITTEN, PRINTED, NONE
+    ('reason_code', 'TEXT'),            # source:HANDWRITTEN (no reading), far:45 (display under FOTOMATES_FAR_PX wide)
+    ('box_px_w', 'INTEGER'),            # the box the crop was cut from, in photo pixels (before enlargement)
+    ('box_px_h', 'INTEGER'),
+    ('cells_expected', 'INTEGER'),      # FOTOMATES_CELL_HISTORY: the contract's cell count from its earlier AI reads
+    ('cells_hint', 'INTEGER'),          # 1: the read told the cell count was kept, 0: made, not kept
+    ('model_calls', 'INTEGER'),         # model requests for this photo: the box request and every read
+    ('prompt_tokens', 'INTEGER'),       # summed over those requests (usage.prompt_tokens)
+    ('completion_tokens', 'INTEGER'),   # the answers' tokens, summed
+    ('cached_tokens', 'INTEGER'),       # prompt tokens the server took from its cache, when it says
+    ('first_token_ms', 'REAL'),         # FOTOMATES_STREAM: time to the first token, summed over the requests
+    ('generation_ms', 'REAL'),          # FOTOMATES_STREAM: first to last token, summed
 )
 
 
@@ -354,6 +379,11 @@ KEEP = os.environ.get('FOTOMATES_KEEP', 'score').strip().lower()
 if KEEP not in ('score', 'agree'):
     raise SystemExit(f'FOTOMATES_KEEP must be score or agree, not {KEEP!r}')
 DISAGREE_SCORE = float(os.environ.get('FOTOMATES_DISAGREE_SCORE', '0.69'))
+# Whether a photo whose first read gave no digits (NO METER, UNREADABLE, BLANK) is read again.
+# 1: as before. 0: the first read stands. On the run of 8-10 Nov 2026 (143,656 photos) 14,621
+# first reads gave no digits and got 19,689 more reads (5% of all model calls); 905 of them
+# then gave digits and 174 gave the saved reading.
+REREAD_EMPTY = os.environ.get('FOTOMATES_REREAD_EMPTY', '1').strip().lower() not in ('0', 'false', 'no', 'off', '')
 
 
 def _third_how():
@@ -369,19 +399,23 @@ def _third_how():
 def reread_rule():
     """The re-read rule in words, for the log: 'reread below 0.7 at 3x' or 'reread off'."""
     crop = f'crop first, kept at {REREAD_BELOW:g} or more, else the whole photo; ' if CROP_FIRST else ''
+    empty = '' if REREAD_EMPTY else '; a first read without digits is not read again'
     if CROP_FIRST and KEEP == 'agree':
         third = 'no third read' if REREAD_SCALE == 1 else 'a third read ' + _third_how()
         return (f'crop and whole photo both read; the same digits keep the crop; different digits: {third}, '
-                f'the digits two reads share kept, else the highest score capped at {DISAGREE_SCORE:g}')
+                f'the digits two reads share kept, else the highest score capped at {DISAGREE_SCORE:g}') + empty
     if REREAD_SCALE == 1:
-        return crop + 'reread off'
-    return crop + f'reread below {REREAD_BELOW:g} {_third_how()}' + ('; the most confident read kept' if CROP_FIRST else '')
+        return crop + 'reread off' + (empty if CROP_FIRST else '')
+    return (crop + f'reread below {REREAD_BELOW:g} {_third_how()}'
+            + ('; the most confident read kept' if CROP_FIRST else '') + empty)
 
 
-def read_scored(path, saved, model=None, scale=1.0, crop=False, box=None, margin=None):
+def read_scored(path, saved, model=None, scale=1.0, crop=False, box=None, margin=None, hint=None):
     """One read of a photo with its consumption and its one score. 'scale' says how it was
-    read: 1.0 as it is, 3.0 enlarged, or the crop's label, e.g. 'crop(2.71x)'."""
-    result = ocr_image(path, model=model, scale=scale, crop=crop, box=box, **({} if margin is None else {'margin': margin}))
+    read: 1.0 as it is, 3.0 enlarged, or the crop's label, e.g. 'crop(2.71x)'. hint: one line
+    for this photo after the image ("This display has N cells.")."""
+    result = ocr_image(path, model=model, scale=scale, crop=crop, box=box, **({} if margin is None else {'margin': margin}),
+                       **({'hint': hint} if hint else {}))
     label = re.search(r'crop\([^)]*\)', result.evidence_source or '') if crop else None
     scale = label[0] if label else scale
     cells = _reading_digits(result.text) or ''
@@ -423,6 +457,10 @@ def read_best(path, saved, model=None):
             raise  # the share is gone: read_with_retries waits for it
         crop = None  # the box or the crop could not be read: the whole photo is read
         box_reason = (('crop read' if box else 'box request') + f' failed: {type(exc).__name__}: {exc}')[:200]
+    if crop and not crop['cells'] and not REREAD_EMPTY:
+        # the display was found and shows nothing to read: the first read stands
+        return dict(crop, reread=False, seconds=seconds, box_answer=box['answer'], box_reason=box_reason,
+                    reads=[crop])
     if crop and KEEP == 'agree':
         return _keep_agreed(path, saved, model, crop, seconds, box, box_reason)
     if crop and crop['score'] is not None and crop['score'] >= REREAD_BELOW:
@@ -483,12 +521,13 @@ def _third_read(path, saved, model, first):
     if REREAD_SCALE == 1:
         return None
     try:
-        if REREAD_MODE == 'crop':  # the box the first read gave; without a usable one, the 3x frame
-            second = read_scored(path, saved, model, REREAD_SCALE, crop=True,
-                                 box=extract_box(first['result'].text),
-                                 margin=THIRD_MARGIN if CROP_FIRST else None)  # a wider cut than the first crop
-        else:
-            second = read_scored(path, saved, model, REREAD_SCALE)
+        with third_read():  # FOTOMATES_FEWSHOT_ON=third: the example photos go with this read
+            if REREAD_MODE == 'crop':  # the box the first read gave; without a usable one, the 3x frame
+                second = read_scored(path, saved, model, REREAD_SCALE, crop=True,
+                                     box=extract_box(first['result'].text),
+                                     margin=THIRD_MARGIN if CROP_FIRST else None)  # a wider cut than the first crop
+            else:
+                second = read_scored(path, saved, model, REREAD_SCALE)
     except Exception as exc:
         if _file_error(exc) is not None:
             raise  # the share is gone: read_with_retries waits for it
@@ -519,15 +558,18 @@ def _read_whole(path, saved, model=None, unsure=None):
         return first  # no resizing: the same image read again gives the same answer (temperature 0)
     if not unsure(first['score']):
         return first
+    if not first['cells'] and not REREAD_EMPTY:
+        return first  # no digits in the first read: it stands
     if extract_no_meter(first['result'].text):
         return first  # no meter in the photo: enlarging it shows none either
     try:
-        if REREAD_MODE == 'crop':  # the box the first read gave; without a usable one, the 3x frame
-            second = read_scored(path, saved, model, REREAD_SCALE, crop=True,
-                                 box=extract_box(first['result'].text),
-                                 margin=THIRD_MARGIN if CROP_FIRST else None)  # a wider cut than the first crop
-        else:
-            second = read_scored(path, saved, model, REREAD_SCALE)
+        with third_read():  # FOTOMATES_FEWSHOT_ON=third: the example photos go with this read
+            if REREAD_MODE == 'crop':  # the box the first read gave; without a usable one, the 3x frame
+                second = read_scored(path, saved, model, REREAD_SCALE, crop=True,
+                                     box=extract_box(first['result'].text),
+                                     margin=THIRD_MARGIN if CROP_FIRST else None)  # a wider cut than the first crop
+            else:
+                second = read_scored(path, saved, model, REREAD_SCALE)
     except Exception:
         # the first read stands when the second fails, and says so
         first['result'].evidence_source = (first['result'].evidence_source or '') + '+reread-failed'
@@ -550,7 +592,7 @@ def read_details(result, reading, reread, other=None, other_reads=None, box_answ
     each = {}
     for one in reads or []:
         role, digits = one.get('role'), one.get('cells') or None
-        if role not in ('crop', 'whole', 'third'):
+        if role not in ('crop', 'whole', 'third', 'hint'):
             continue
         chances = list(getattr(one['result'], 'digit_confidence', None) or [])
         each.update({f'{role}_digits': digits,
@@ -721,28 +763,149 @@ def read_with_retries(path, saved, model=None, share=None):
         photo_bytes.cache_clear()  # never read again a copy taken while the share was failing
 
 
+# Task 3. A display whose box is narrower than this many photo pixels was photographed from too far
+# to read (1-2 m: 30-50 px in a 240x400 photo): reason_code far:<width>. The reading is not changed.
+# 0 turns it off.
+FAR_PX = float(os.environ.get('FOTOMATES_FAR_PX', '60'))
+
+# Task 6. FOTOMATES_CELL_HISTORY=1 (default off): a read with fewer cells than the same contract's
+# and register's last confident AI read (score CELL_HISTORY_SCORE or more, taken before this photo)
+# is read once more, told "This display has N cells."; that read is kept when it has N cells.
+# The count comes from the AI's own reads only, never from the saved reading.
+CELL_HISTORY = os.environ.get('FOTOMATES_CELL_HISTORY', '0').strip().lower() not in ('0', 'false', 'no', 'off', '')
+CELL_HISTORY_SCORE = 0.9
+
+
+class CellHistory:
+    """The cell_counts table in memory, shared by the workers (they look up) and the main thread
+    (it records each saved photo)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.counts = {}  # (contract, register) -> {picture_name: (date, cells)}
+
+    def load(self, db):
+        """Fills cell_counts from the confident reads already in the database, then reads it."""
+        db.execute(f"""INSERT OR IGNORE INTO cell_counts (picture_name, contract_id, register, date, cells)
+                       SELECT picture_name, contract_id, register, date, length(extracted_reading) FROM readings
+                       WHERE score >= {CELL_HISTORY_SCORE} AND contract_id IS NOT NULL
+                         AND extracted_reading IS NOT NULL AND status IN ('done', 'no_saved_reading')""")
+        db.commit()
+        with self.lock:
+            self.counts = {}
+            for name, contract, register, date, cells in db.execute(
+                    'SELECT picture_name, contract_id, register, date, cells FROM cell_counts'):
+                self.counts.setdefault((contract, register), {})[name] = (date or '', cells)
+
+    def expected(self, contract, register, date, name):
+        """The cell count of the latest confident read of this contract and register taken before
+        date (any other photo when the date is not known); None when there is none."""
+        with self.lock:
+            known = self.counts.get((contract, register)) or {}
+            earlier = [(when, cells) for other, (when, cells) in known.items()
+                       if other != name and (not date or not when or when < date)]
+        return max(earlier)[1] if earlier else None
+
+    def record(self, db, row):
+        """After a photo is saved: its cell count is kept when it is confident, else forgotten."""
+        name, contract = row['picture_name'], row.get('contract_id')
+        if not contract:
+            return
+        key = (contract, row.get('register'))
+        score, digits = row.get('score'), row.get('extracted_reading')
+        if row.get('status') in ('done', 'no_saved_reading') and digits and score is not None \
+                and score >= CELL_HISTORY_SCORE:
+            db.execute('INSERT OR REPLACE INTO cell_counts (picture_name, contract_id, register, date, cells) '
+                       'VALUES (?, ?, ?, ?, ?)', (name, contract, row.get('register'), row.get('date'), len(digits)))
+            with self.lock:
+                self.counts.setdefault(key, {})[name] = (row.get('date') or '', len(digits))
+        else:
+            db.execute('DELETE FROM cell_counts WHERE picture_name = ?', (name,))
+            with self.lock:
+                (self.counts.get(key) or {}).pop(name, None)
+
+
+CELLS = CellHistory()
+
+
+def _cells_hint_read(path, saved, model, read, expected):
+    """FOTOMATES_CELL_HISTORY: the photo read once more when it gave fewer cells than expected,
+    told the count, on the crop when the box was used (else the whole photo). That read is kept
+    when it has the expected count; otherwise the read before it stays. Adds cells_hint."""
+    cells = read.get('cells') or ''
+    if not cells or len(cells) >= expected:
+        return read
+    box = parse_box(read.get('box_answer')) if read.get('box_answer') and not read.get('box_reason') else None
+    try:
+        hinted = read_scored(path, saved, model, crop=bool(box), box=box, hint=f'This display has {expected} cells.')
+    except Exception:
+        return dict(read, cells_hint=0)  # the read before it stands
+    hinted = dict(hinted, role='hint')
+    seconds = (read.get('seconds') or 0.0) + (hinted['result'].reading_seconds or 0.0)
+    reads = [dict(r, other=None) for r in (read.get('reads') or [])] + [hinted]
+    if len(hinted['cells'] or '') != expected:
+        others = [hinted] + list(read.get('others') or [])
+        return dict(read, reread=True, seconds=seconds, reads=reads, others=others,
+                    other=read.get('other') or hinted, cells_hint=0)
+    before = dict(read, other=None, others=None, reads=None)
+    others = [before] + list(read.get('others') or [])
+    return dict(hinted, reread=True, seconds=seconds, other=before, others=others, reads=reads,
+                box_answer=read.get('box_answer'), box_reason=read.get('box_reason'), cells_hint=1)
+
+
+def _box_pixels(read, result):
+    """The box the crop was cut from, in photo pixels (width, height), before any margin or
+    enlargement; None when no box was used."""
+    if not read.get('box_answer') or read.get('box_reason'):
+        return None
+    box, image = parse_box(read['box_answer']), result.image_report or {}
+    if not box or not image.get('width') or not image.get('height'):
+        return None
+    x1, y1, x2, y2 = box
+    return round((x2 - x1) / 1000 * image['width']), round((y2 - y1) / 1000 * image['height'])
+
+
 def read_one(path, month, model=None):
     row = parse_name(path.name, month)  # contract, date, register, saved reading, reader, anomaly, place
     started = time.monotonic()
+    start_photo_stats()  # what this photo's model requests cost (Task 11)
+    expected = None
     try:
         read = read_with_retries(path, row['saved_reading'], model)
+        if CELL_HISTORY and row['contract_id']:
+            expected = CELLS.expected(row['contract_id'], row['register'], row['date'], path.name)
+            if expected:
+                read = _cells_hint_read(path, row['saved_reading'], model, read, expected)
         result = read['result']
     except Exception as exc:
-        return dict(row, model=model_backend(model).model, picture_name=path.name, extracted_reading=None, extracted_whole=None,
+        return dict(row, **photo_stats(), model=model_backend(model).model, picture_name=path.name,
+                    extracted_reading=None, extracted_whole=None,
                     extracted_decimals=None, match='no', status='error', score=None, retake=None,
                     seconds=round(time.monotonic() - started, 2), error=str(exc)[:2000], source_path=str(path.absolute()))
     reading = _reading_digits(result.text) or None  # as read: leading zeros kept
+    whole, decimals, match, score = read['whole'], read['decimals'], read['match'], read['score']
+    source = extract_source(result.text)
+    codes = []
     if extract_blank(result.text):
         status = 'blank'
+    elif extract_off(result.text):
+        status = 'off'  # a meter whose display is dark: no power
     elif extract_no_meter(result.text):
         status = 'no_meter'
+    elif reading and source in NOT_A_REGISTER:
+        # Task 1: digits that are not on a meter's register (marker on a casing, a label) give no
+        # reading; the digits and their probabilities stay in the export.
+        status, whole, decimals, match = 'no_meter', None, None, 'no'
+        codes.append(f'source:{source}')
     elif not reading:
         status = 'missing'
     elif not row['saved_reading']:
         status = 'no_saved_reading'
     else:
         status = 'done'
-    whole, decimals, match, score = read['whole'], read['decimals'], read['match'], read['score']
+    box_px = _box_pixels(read, result)
+    if box_px and FAR_PX > 0 and max(box_px) < FAR_PX:  # the longer side: a display on its side too
+        codes.append(f'far:{max(box_px)}')
     quality = re.findall(r'^QUALITY:[ \t]*\**[ \t]*(CLEAR|POOR|\d+)', result.text, re.IGNORECASE | re.MULTILINE)
     reason = photo_retake_reason(reading, result.clear) if reading else None
     if not reason and score is not None and score < RETAKE_SCORE:
@@ -750,7 +913,10 @@ def read_one(path, month, model=None):
     details = read_details(result, reading, read.get('reread'), read.get('other'), read.get('others'),
                            read.get('box_answer'), read.get('reads'), read.get('box_reason'))
     too_long = bool(read['parts'] and read['parts'].get('too_long'))
-    return dict(row, **details, model=model_backend(model).model, picture_name=path.name, extracted_reading=reading,
+    return dict(row, **details, **photo_stats(), source=source, reason_code=','.join(codes) or None,
+                box_px_w=box_px[0] if box_px else None, box_px_h=box_px[1] if box_px else None,
+                cells_expected=expected, cells_hint=read.get('cells_hint'),
+                model=model_backend(model).model, picture_name=path.name, extracted_reading=reading,
                 extracted_whole=whole, extracted_decimals=decimals, match=match,
                 status=status, score=score, visual_decimals=result.decimal_digits,
                 clear=None if result.clear is None else round(result.clear, 3),
@@ -774,8 +940,69 @@ def save(db, row):
                f'VALUES ({",".join("?" * len(COLUMNS))})', [row.get(c) for c in COLUMNS])
 
 
+def capacity_rate(times):
+    """Photos per second over the finish times given (time.monotonic(), oldest first); None for
+    fewer than two."""
+    if len(times) < 2 or times[-1] <= times[0]:
+        return None
+    return (len(times) - 1) / (times[-1] - times[0])
+
+
+def finish_time(left, rate, now=None):
+    """When left photos are done at rate photos per second, in local time; None without a rate."""
+    if not rate:
+        return None
+    return (now or datetime.now()) + timedelta(seconds=left / rate)
+
+
+def capacity_line(rate_now, average, left, listing_done=True, now=None):
+    """CAPACITY: 4,610 photos/hour now (110,640/day) | average 4,480/hour | 98,300 left | finishes about Thu 12 Nov 21:40"""
+    rate = rate_now or average
+    parts = [f'{rate_now * 3600:,.0f} photos/hour now ({rate_now * 86400:,.0f}/day)' if rate_now else 'rate now not known yet',
+             f'average {average * 3600:,.0f}/hour' if average else 'average not known yet',
+             f'{left:,} left' if listing_done else f'{left:,}+ left (still listing)']
+    end = finish_time(left, rate, now)
+    if end:
+        parts.append(f'finishes {"about" if listing_done else "at the earliest"} {end:%a %d %b %H:%M}')
+    return 'CAPACITY: ' + ' | '.join(parts)
+
+
+def _duration(seconds):
+    hours, minutes = divmod(round(seconds / 60), 60)
+    return f'{hours} h {minutes} min' if hours else f'{minutes} min'
+
+
+def _median(values):
+    values = sorted(values)
+    if not values:
+        return None
+    middle = len(values) // 2
+    return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+
+
+def _percentile(values, share):
+    values = sorted(values)
+    return values[min(len(values) - 1, int(share * len(values)))] if values else None
+
+
+def _day_label(folders):
+    """2026-10-27 for a folder ending in 2026/10/27; else the folders as given."""
+    days = []
+    for folder in folders or []:
+        parts = Path(folder).parts[-3:]
+        days.append('-'.join(parts) if len(parts) == 3 and all(p.isdigit() for p in parts) else str(folder))
+    return ', '.join(days) or 'the listed photos'
+
+
+CAPACITY_WINDOW = 600  # seconds: "now" in the CAPACITY line is the rate over the last 10 minutes
+
+
 def command_read(args):
     db = connect(args.db)
+    if CELL_HISTORY:
+        CELLS.load(db)
+        print(f'Cell history: {sum(map(len, CELLS.counts.values())):,} confident reads of '
+              f'{len(CELLS.counts):,} contract registers', flush=True)
     choice = model_backend(args.model)
     slots = server_slots(choice.servers)
     workers = args.workers or image_workers(choice, slots)
@@ -786,6 +1013,13 @@ def command_read(args):
     failed_now = {}  # picture name -> path of the photos saved as an error in this run
     saved_names_so_far = {row[0] for row in db.execute('SELECT picture_name FROM readings')}
     print(f'Resuming with {len(saved_names_so_far)} saved photos; completed photos are skipped.', flush=True)
+    # Task 12: what is left and when it ends. The listing runs in a thread of its own, so the
+    # counts are filled as it goes; TO READ is printed when it is complete.
+    done_at_start = frozenset(name for (name,) in db.execute(
+        'SELECT picture_name FROM readings' + ('' if args.skip_errors else " WHERE status != 'error'")))
+    listing = dict(listed=0, saved=0, done=False)
+    finished = deque()  # finish times of the last CAPACITY_WINDOW seconds
+    every_seconds, every_calls, every_prompt, every_answer, every_first, every_generation = [], [], [], [], [], []
     model_seconds = 0.0
     pending = set()
     seen = []  
@@ -847,6 +1081,20 @@ def command_read(args):
                 seen.append(path.name)
             yield path
 
+    def counted(paths, label):
+        """The paths, counted as they are listed; TO READ when the listing is complete."""
+        for path in paths:
+            listing['listed'] += 1
+            listing['saved'] += path.name in done_at_start
+            yield path
+        listing['done'] = True
+        left = listing['listed'] - listing['saved']
+        print(f"TO READ: {listing['listed']:,} photos for {label} ({listing['saved']:,} already saved, "
+              f"{left:,} left)", flush=True)
+
+    def left_to_read():
+        return max(0, listing['listed'] - listing['saved'] - count)
+
     def collect(done):
         nonlocal count, matched, failed, rejected, codes, too_long, model_seconds
         for future in done:
@@ -860,6 +1108,20 @@ def command_read(args):
             else:
                 failed_now.pop(row['picture_name'], None)
             saved_names_so_far.add(row['picture_name'])
+            if CELL_HISTORY:
+                CELLS.record(db, row)
+                db.commit()
+            now = time.monotonic()
+            finished.append(now)
+            while finished and finished[0] < now - CAPACITY_WINDOW:
+                finished.popleft()
+            if row['status'] != 'error':
+                every_seconds.append(row['seconds'] or 0.0)
+                every_calls.append(row.get('model_calls') or 0)
+                for values, key in ((every_prompt, 'prompt_tokens'), (every_answer, 'completion_tokens'),
+                                    (every_first, 'first_token_ms'), (every_generation, 'generation_ms')):
+                    if row.get(key) is not None:
+                        values.append(row[key])
             count += 1
             matched += row['match'] == 'yes'
             failed += row['status'] == 'error'
@@ -869,7 +1131,7 @@ def command_read(args):
             model_seconds += row['seconds'] or 0
             if args.verbose:
                 result = (('MATCH' if row['match'] == 'yes' else 'MISMATCH') if row['status'] == 'done' else
-                          {'no_meter': 'NO_METER_FOUND'}.get(row['status'], row['status'].upper()))
+                          {'no_meter': 'NO_METER_FOUND', 'off': 'DISPLAY_OFF'}.get(row['status'], row['status'].upper()))
                 score = '-' if row['score'] is None else f"{row['score']:.3f}"
                 elapsed = time.monotonic() - started
                 print(f"[{count} this run | {len(saved_names_so_far)} saved] {row['picture_name']} "
@@ -898,6 +1160,7 @@ def command_read(args):
                       f'{codes} register codes removed, {too_long} with 12+ digits'
                       + (f' | {failed} failed (model server gave no answer; --only-failed reads them again)'
                          if failed else ''), flush=True)
+                print(capacity_line(capacity_rate(finished), rate, left_to_read(), listing['done']), flush=True)
         report_every = getattr(args, 'report_every', 1000)
         if report_every and count - last_report_count >= report_every:
             checkpoint_reports()
@@ -943,10 +1206,13 @@ def command_read(args):
             # listing of the share, and nothing new is read.
             if getattr(args, 'files_csv', None):
                 print(f'Reading only explicit paths in: {args.files_csv}', flush=True)
-                paths = unread(db, listed(csv_photos(args.files_csv)), retry_errors=not args.skip_errors)
+                paths = unread(db, listed(prefetch(counted(csv_photos(args.files_csv), args.files_csv))),
+                               retry_errors=not args.skip_errors)
             else:
-                paths = (listed(failed_photos(db, args.folders)) if args.only_failed else
-                         unread(db, listed(prefetch(photos(args.folders))), retry_errors=not args.skip_errors))
+                paths = (listed(counted(failed_photos(db, args.folders), _day_label(args.folders)))
+                         if args.only_failed else
+                         unread(db, listed(prefetch(counted(photos(args.folders), _day_label(args.folders)))),
+                                retry_errors=not args.skip_errors))
             read_all(paths, args.limit)
             if not args.skip_errors:
                 errors_again()
@@ -961,8 +1227,13 @@ def command_read(args):
     reporter.shutdown(wait=True)  # a checkpoint still writing finishes before the final one
     write_reports(db)
     elapsed = time.monotonic() - started
-    print(f'{"stopped safely" if interruption else "done"}: {count} photos in {elapsed:.0f} s'
-          + (f' ({count / elapsed:.2f} photos/s)' if elapsed else ''), flush=True)
+    rate = count / elapsed if elapsed else 0.0
+    print(f'{"stopped safely" if interruption else "done"}: {count:,} photos in {_duration(elapsed)} '
+          f'({rate * 3600:,.0f} photos/hour, {rate * 86400:,.0f}/day)'
+          + (f', {sum(every_calls) / len(every_calls):.1f} model calls and {model_seconds / count:.1f} s per photo'
+             if every_calls and count else '') + '.', flush=True)
+    for line in cost_lines(every_seconds, every_calls, every_prompt, every_answer, every_first, every_generation):
+        print(line, flush=True)
     if not args.no_word:
         try:
             where, params = ('WHERE month IS ?', [_month(args.month)]) if args.month else ('', [])
@@ -973,6 +1244,23 @@ def command_read(args):
     db.close()
     if interruption:
         raise SystemExit(1)
+
+
+def cost_lines(seconds, calls, prompt, answer, first, generation):
+    """The run's cost per photo, for its closing lines: seconds (median, p90), model calls,
+    prompt and answer tokens, and, when streamed, the time before the first token and generating."""
+    if not seconds:
+        return []
+    lines = [f'COST: {len(seconds):,} photos read; {_median(seconds):.1f} s per photo (median), '
+             f'{_percentile(seconds, 0.9):.1f} s (p90); {sum(calls) / len(calls):.2f} model calls per photo'
+             + (f'; {sum(prompt) / len(prompt):,.0f} prompt tokens per photo' if prompt else '')
+             + (f'; {sum(answer) / max(sum(calls), 1):.1f} answer tokens per call' if answer and sum(calls) else '')]
+    if first and generation:
+        total = sum(first) + sum(generation)
+        lines.append(f'COST: per photo, {_median(first):,.0f} ms to the first token and {_median(generation):,.0f} ms '
+                     f'generating (medians); {100 * sum(first) / total:.0f}% of model time before the first token, '
+                     f'{100 * sum(generation) / total:.0f}% generating' if total else 'COST: no stream timings')
+    return lines
 
 
 def folder_rows(db, names):
@@ -1074,6 +1362,7 @@ def summary(db, month=None):
                SUM(status = 'missing') AS missing_reading,
                SUM(status = 'no_meter') AS no_meter,
                SUM(status = 'blank') AS blank,
+               SUM(status = 'off') AS display_off,
                SUM(status = 'no_saved_reading') AS no_saved_reading,
                SUM(status = 'error') AS failed,
                ROUND(100.0 * SUM(match = 'yes') / NULLIF(SUM(status IN ('done', 'missing')), 0), 2)
@@ -1148,7 +1437,7 @@ def list_query(kind, month=None, contract=None):
                 'ORDER BY month, contract_id', params)
     if kind == 'missing':
         return (f"SELECT {_PICKED}, error FROM readings "
-                f"WHERE status IN ('missing', 'no_meter', 'blank', 'error', 'no_saved_reading'){also} "
+                f"WHERE status IN ('missing', 'no_meter', 'blank', 'off', 'error', 'no_saved_reading'){also} "
                 'ORDER BY status, month, contract_id', params)
     where = ' WHERE ' + ' AND '.join(filters) if filters else ''
     return (f'SELECT month, {_PICKED}, retake, error, read_at FROM readings{where} '
@@ -1182,7 +1471,8 @@ def command_import_log(args):
             visual = re.search(r'\| visual decimals=(\d+|-)', line)
             visual_decimals = int(visual[1]) if visual and visual[1] != '-' else None
             whole, decimals, match = split_decimals(raw, row['saved_reading'], visual_decimals)
-            status = {'MATCH': 'done', 'MISMATCH': 'done', 'NO_METER_FOUND': 'no_meter'}.get(result, result.lower())
+            status = {'MATCH': 'done', 'MISMATCH': 'done', 'NO_METER_FOUND': 'no_meter',
+                      'DISPLAY_OFF': 'off'}.get(result, result.lower())
             if status == 'done' and not row['saved_reading']:
                 status = 'no_saved_reading'
             score = None if m['score'] == '-' else float(m['score'])
@@ -1281,6 +1571,7 @@ def write_csv(path, cursor):
 _RESULT = f'''CASE WHEN status = 'error' THEN 'Processing error'
                     WHEN status = 'no_meter' THEN 'No meter'
                     WHEN status = 'blank' THEN 'Blank photo'
+                    WHEN status = 'off' THEN 'Display off'
                     WHEN status = 'missing' THEN 'No readable digits'
                     WHEN status = 'no_saved_reading' THEN 'No saved reading'
                     WHEN match = 'yes' THEN 'Match'
@@ -1292,7 +1583,7 @@ _RESULT = f'''CASE WHEN status = 'error' THEN 'Processing error'
 # or (reading_attempts) a copy of the database table of earlier attempts.
 EXTRA_REPORTS = ('summary.csv', 'comparison.csv', 'mismatches.csv', 'missing.csv', 'duplicates.csv',
                  'mismatches_high_score.csv', 'mismatches_low_score.csv', 'no_digits.csv', 'no_meter.csv',
-                 'blank.csv', 'no_saved_reading.csv', 'errors.csv', 'reading_attempts.csv', 'retry_failures.csv')
+                 'blank.csv', 'off.csv', 'no_saved_reading.csv', 'errors.csv', 'reading_attempts.csv', 'retry_failures.csv')
 
 
 def export_reports(db, out, month=None, quiet=False, everything=False):
@@ -1332,6 +1623,7 @@ def summary_lines(totals):
     return [f"{t['month']}: {t['photos']} photos, {t['read_correctly']} read correctly ({t['percent_correct']}%), "
             f"{t['mismatch']} mismatch ({t['mismatch_high_score']} high score, {t['mismatch_low_score']} low score), "
             f"{t['missing_reading']} no reading, {t['no_meter']} no meter, {t['blank']} blank, "
+            + (f"{t['display_off']} display off, " if t.get('display_off') else '') +
             f"{t['no_saved_reading']} no saved reading, {t['failed']} failed, "
             f"{t['seconds_per_photo']} s per photo"
             + (f"; read twice {t['reread_photos']}: {t['reread_agree']} same digits, {t['reread_differ']} different "
@@ -1365,7 +1657,7 @@ def write_extra_reports(db, out, month=None):
     for label, condition in (('high_score', 'score >= ?'), ('low_score', 'score < ?')):
         write_csv(out / f'mismatches_{label}.csv', db.execute(
             f'SELECT * FROM ({mismatch_sql}) WHERE {condition}', [*mismatch_params, RETAKE_SCORE]))
-    for label, status in (('no_digits', 'missing'), ('no_meter', 'no_meter'), ('blank', 'blank'),
+    for label, status in (('no_digits', 'missing'), ('no_meter', 'no_meter'), ('blank', 'blank'), ('off', 'off'),
                           ('no_saved_reading', 'no_saved_reading'), ('errors', 'error')):
         write_csv(out / f'{label}.csv', db.execute(
             f'SELECT month, {_PICKED}, error, read_at FROM readings WHERE status = ?' +
@@ -1429,7 +1721,9 @@ def main():
 
     read = commands.add_parser('read', help='read photos and store the results')
     read.add_argument('folders', nargs='*')
-    read.add_argument('--files-csv', help='read only paths in a CSV with picture_name and source_path; no folder scan')
+    read.add_argument('--files-csv', '--photos', dest='files_csv',
+                      help='read only paths in a CSV with picture_name and source_path (test_set.csv too); '
+                           'no folder scan')
     read.add_argument('--month', help='YYYY-MM for photos whose name carries no date')
     read.add_argument('--workers', type=int, help='photos read at once (default: from the model server)')
     read.add_argument('--model', choices=list(MODEL_BACKENDS), default='default',

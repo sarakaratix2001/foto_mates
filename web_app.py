@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import csv
 import io
@@ -24,7 +25,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from audit_readings import (AUDIT_DB, LIST_KINDS, connect as audit_connect, excel_row, list_query, parse_name,
+from audit_readings import (AUDIT_DB, CAPACITY_WINDOW, LIST_KINDS, capacity_line, capacity_rate,
+                            connect as audit_connect, excel_row, finish_time, list_query, parse_name,
                             read_best, split_decimals, summary as audit_summary)
 from evaluation import LABELS as EVALUATION_LABELS, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, OCR_MODEL, PHOTO_TYPES, QUALITY_DIGIT, QUALITY_SCORE,
@@ -207,8 +209,27 @@ def process_job(job):
     pending = [item for item in job['images'] if item['status'] in ('queued', 'processing')]
     choice = model_backend(job.get('model'))
     job['model_label'] = choice.label
+    finished = deque()  # finish times of the last CAPACITY_WINDOW seconds
+
+    def one(item):
+        process_image(job, item)
+        with LOCK:  # the capacity of the running batch, shown under its progress on the page
+            now = time.monotonic()
+            finished.append(now)
+            while finished and finished[0] < now - CAPACITY_WINDOW:
+                finished.popleft()
+            left = sum(i['status'] in ('queued', 'processing') for i in pending)
+            done = len(pending) - left
+            rate_now, average = capacity_rate(finished), done / max(now - started, 1e-6)
+            end = finish_time(left, rate_now or average)
+            job['capacity'] = dict(per_hour_now=None if rate_now is None else round(rate_now * 3600),
+                                   left=left, finishes_at=end.isoformat(timespec='minutes') if end else None,
+                                   average_per_hour=round(average * 3600),
+                                   line=capacity_line(rate_now, average, left))
+        save_job(job)
+
     with ThreadPoolExecutor(max_workers=image_workers(choice)) as pool:
-        list(pool.map(lambda item: process_image(job, item), pending))
+        list(pool.map(one, pending))
     job['seconds'] = round(time.monotonic() - started, 1)
     job['status'] = 'done'
     print(f"batch of {len(job['images'])} photos: {job['seconds']}s "

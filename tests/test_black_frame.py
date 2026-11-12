@@ -190,7 +190,7 @@ class EveryReadTest(unittest.TestCase):
 
     def test_old_database_gets_the_columns(self):
         new = {name for name, _ in DETAIL_COLUMNS if name.split('_')[0] in ('crop', 'whole', 'third', 'box')}
-        self.assertEqual(len(new), 14)
+        self.assertEqual(len(new), 16)  # with box_px_w and box_px_h (Task 3)
         with tempfile.TemporaryDirectory() as folder:
             path = str(Path(folder) / 'old.sqlite3')
             connect(path).close()

@@ -91,7 +91,8 @@ async function loadOverview(){
   const photos=sum('photos'),ok=sum('read_correctly'),judged=ok+sum('mismatch')+sum('missing_reading');
   const pct=judged?(100*ok/judged).toFixed(2)+'%':'–';
   $('tiles').innerHTML=[['Photos read',photos,''],['Read correctly',ok,'good'],['Mismatch',sum('mismatch'),'bad'],
-    ['Missing reading',sum('missing_reading'),'warn'],['Failed',sum('failed'),'warn'],['% correct',pct,'good']]
+    ['Missing reading',sum('missing_reading'),'warn'],...(sum('display_off')?[['Display off',sum('display_off'),'warn']]:[]),
+    ['Failed',sum('failed'),'warn'],['% correct',pct,'good']]
     .map(([l,v,c])=>`<div class="tile ${c}">${l}<b>${fmt(v)}</b></div>`).join('');
   const cols=['month','photos','read_correctly','mismatch','missing_reading','no_saved_reading','failed','percent_correct','contracts','seconds_per_photo'];
   $('months').tBodies[0].innerHTML=d.months.map(m=>`<tr class="pick${m.month===state.month?' chosen':''}" data-month="${escape(m.month)}">`+
