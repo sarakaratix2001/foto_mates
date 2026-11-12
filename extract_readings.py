@@ -16,7 +16,6 @@ import cv2
 import httpx
 import numpy as np
 from openai import OpenAI
-from detect_quality import assess, enhance
 
 
 def _load_env_file(path: Path) -> None:
@@ -31,6 +30,7 @@ def _load_env_file(path: Path) -> None:
 
 
 _load_env_file(Path(__file__).resolve().parent / '.env')
+from detect_quality import assess, enhance  # after .env: it reads FOTOMATES_ENHANCER on import
 
 
 def _required_env(name: str) -> str:
@@ -227,7 +227,14 @@ def _streamed(server, request: dict):
         extra = getattr(chunk, 'model_extra', None) or {}
         timings = extra.get('timings') or timings
         for part in getattr(chunk, 'choices', None) or []:
-            piece = getattr(getattr(part, 'delta', None), 'content', None)
+            delta = getattr(part, 'delta', None)
+            piece = getattr(delta, 'content', None)
+            if not piece and delta is not None:
+                # The model server streams the answer's text as delta.reasoning (thinking is off
+                # on every request, so nothing else is written there); content stays empty.
+                other = getattr(delta, 'model_extra', None) or {}
+                piece = (other.get('reasoning') or other.get('reasoning_content')
+                         or getattr(delta, 'reasoning', None) or getattr(delta, 'reasoning_content', None))
             logprobs = getattr(getattr(part, 'logprobs', None), 'content', None)
             if piece or logprobs:
                 now = time.monotonic()
@@ -1191,7 +1198,9 @@ if BOX_ANSWER == 'numbers':
     BOX_PROMPT = _swap(BOX_PROMPT, 'Answer only with JSON: {"bbox_2d": [x1, y1, x2, y2]}',
                        'Answer with four integers from 0 to 1000 separated by commas: x1,y1,x2,y2, nothing '
                        'else; NONE when there is no display.')
-BOX_MAX_TOKENS = 16 if BOX_ANSWER == 'numbers' else 60
+# 32, not 16: the model writes [321, 393, 714, 538] with a bracket and spaces as often as
+# 321,393,714,538, and digits are one token each; at 16 the fourth number was cut off.
+BOX_MAX_TOKENS = 32 if BOX_ANSWER == 'numbers' else 60
 if PROMPT in ('v3', 'v4'):  # a tight box can cut the small last cell off
     BOX_PROMPT = _swap(BOX_PROMPT, 'shows the consumption.',
                        'shows the consumption, including any smaller decimal cell at the right end of the row.')
@@ -1231,12 +1240,16 @@ def find_box(image_path: Path, model: str | None = None) -> dict:
     # FOTOMATES_PREFIX: the same start as a crop read (its system message), so both share the cached prefix.
     messages = ([{'role': 'system', 'content': system_prompt(crop=True)}] if PREFIX else []) + [
         {'role': 'user', 'content': question}]
-    message = model_call(server=servers[next(_TURN) % len(servers)], model=choice.model, temperature=0,
-                         max_tokens=BOX_MAX_TOKENS, extra_body=dict(NO_THINKING),
-                         messages=messages).choices[0].message
-    answer = (message.content or '').strip()
+    answered = model_call(server=servers[next(_TURN) % len(servers)], model=choice.model, temperature=0,
+                          max_tokens=BOX_MAX_TOKENS, extra_body=dict(NO_THINKING),
+                          messages=messages).choices[0]
+    answer = (answered.message.content or '').strip()
     box = parse_box(answer)
-    rect, why = crop_rect(box, width, height) if box else (None, 'no box')
+    if box and BOX_ANSWER == 'numbers' and getattr(answered, 'finish_reason', None) == 'length':
+        # the answer ran into max_tokens: its last number may have lost a digit, so it is no box
+        box, rect, why = None, None, 'box answer cut off'
+    else:
+        rect, why = crop_rect(box, width, height) if box else (None, 'no box')
     return dict(box=tuple(box) if rect else None, why=why, answer=answer, seconds=time.monotonic() - started)
 
 

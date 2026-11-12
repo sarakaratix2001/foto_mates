@@ -8,7 +8,9 @@ digits fit the truth (the reading typed in the review when there is one, else th
 reading) by the report's rule: up to three trailing decimals, four on reads of nine or more
 cells, or within 1. Per group and colour it prints how many photos were fixed (wrong in OLD,
 right in NEW), broken (right, then wrong), changed but still wrong, and unchanged; then the
-seconds and model calls per photo of both runs.
+seconds and model calls per photo of both runs, and the photos whose status changed (done,
+missing, no_meter, blank, off) or that carry a reason code (far, source) in NEW: the tests of
+OFF, SOURCE, far and the near-black check are about these, not about digits.
 
 A change ships only when fixed clearly exceeds broken on the red rows and the confident
 matches lose nothing.
@@ -121,6 +123,26 @@ def compare(old: dict, new: dict, test_set: list):
     return table, listed
 
 
+def status_changes(old: dict, new: dict, test_set: list):
+    """{(group, colour, old status, new status): [review row or photo name, ...]} for the photos
+    whose status differs, and {(group, colour, reason): [...]} for the reason codes of NEW (far,
+    source:HANDWRITTEN ...; the number after far: is left out)."""
+    moved, reasons = defaultdict(list), defaultdict(list)
+    for item in test_set:
+        name = item['picture_name']
+        before, after = old.get(name), new.get(name)
+        if before is None or after is None:
+            continue
+        key = (item.get('group') or '', item.get('colour') or '')
+        label = (item.get('review_row') or '').strip() or name
+        was, now = (before.get('status') or '').strip(), (after.get('status') or '').strip()
+        if was != now:
+            moved[key + (was or '-', now or '-')].append(label)
+        for code in filter(None, (c.strip() for c in (after.get('reason_code') or '').split(','))):
+            reasons[key + ('far' if code.startswith('far:') else code,)].append(label)
+    return moved, reasons
+
+
 def run_cost(run: dict, names) -> dict:
     seconds = [float(run[n]['seconds']) for n in names if n in run and (run[n].get('seconds') or '').strip()]
     calls = [model_calls(run[n]) for n in names if n in run]
@@ -154,7 +176,18 @@ def report(old: dict, new: dict, test_set: list, out=None, show=20) -> dict:
                   file=out)
             for (group, colour), name, truth, was, now in listed[kind][:show]:
                 print(f'  {group}/{colour or "-"} {name}: truth {truth}, old {was or "-"}, new {now or "-"}', file=out)
-    return dict(table=table, total=total)
+    moved, reasons = status_changes(old, new, test_set)
+    if moved:
+        print('\nstatus changed (group/colour: old -> new: photos; review rows):', file=out)
+        for (group, colour, was, now), rows in sorted(moved.items()):
+            print(f'  {group}/{colour or "-"}: {was} -> {now}: {len(rows)}; '
+                  + ', '.join(rows[:show]) + (' ...' if len(rows) > show else ''), file=out)
+    if reasons:
+        print('\nreason codes in NEW (group/colour: code: photos; review rows):', file=out)
+        for (group, colour, code), rows in sorted(reasons.items()):
+            print(f'  {group}/{colour or "-"}: {code}: {len(rows)}; '
+                  + ', '.join(rows[:show]) + (' ...' if len(rows) > show else ''), file=out)
+    return dict(table=table, total=total, status_changed=moved, reasons=reasons)
 
 
 def main(argv=None):

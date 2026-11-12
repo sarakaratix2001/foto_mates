@@ -30,7 +30,7 @@ from audit_readings import (AUDIT_DB, CAPACITY_WINDOW, LIST_KINDS, capacity_line
                             read_best, split_decimals, summary as audit_summary)
 from evaluation import LABELS as EVALUATION_LABELS, evaluate, lines as evaluation_lines
 from extract_readings import (BACKENDS as MODEL_BACKENDS, OCR_MODEL, PHOTO_TYPES, QUALITY_DIGIT, QUALITY_SCORE,
-                              RETAKE_SCORE, _reading_digits, photo_retake_reason, backend as model_backend, extract_blank, extract_no_meter, score_reading,
+                              RETAKE_SCORE, _reading_digits, photo_retake_reason, backend as model_backend, extract_blank, extract_no_meter, extract_off, extract_source, NOT_A_REGISTER, score_reading,
                               image_workers as workers_for, low_score_reasons, ocr_image, quality_reasons,
                               server_slots, warm_up)
 
@@ -89,9 +89,16 @@ def verdict(reading, score=None, parts=None, seconds=None, text=None, clear=None
     if not reading and extract_blank(text):
         return dict(status='blank', retake=True, quality_note=None,
                     retake_reason='the photo is blank: nothing recognisable in it')
+    if not reading and extract_off(text):  # prompt v3/v4: a meter whose display is dark
+        return dict(status='off', retake=True, quality_note=None,
+                    retake_reason='the meter display is off (dark, no power)')
     if not reading and extract_no_meter(text):
         return dict(status='no_meter', retake=True, quality_note=None,
                     retake_reason='no meter found in the photo')
+    source = extract_source(text)
+    if reading and source in NOT_A_REGISTER:  # prompt v3/v4: digits that are not on a meter's register
+        return dict(status='no_meter', retake=True, quality_note=None,
+                    retake_reason=f'the digits are not on a meter display ({source.lower()}): no reading taken')
     if not reading:
         return dict(status='no_digits', retake=True, quality_note=None,
                     retake_reason='no reading could be taken from the photo')
@@ -126,7 +133,7 @@ def consumption(filename, cells, per_digit=None, margins=None, runner_ups=None, 
 
 def with_verdicts(job):
     for item in job['images']:
-        if item.get('status') in ('done', 'no_digits', 'no_meter', 'blank'):
+        if item.get('status') in ('done', 'no_digits', 'no_meter', 'blank', 'off'):
             item.update(consumption(item.get('filename'), item.get('all_digits') or item.get('reading'),
                                     item.get('digit_confidence'), item.get('digit_margin'),
                                     item.get('digit_runner_up'), item.get('digit_alternatives'),
@@ -141,8 +148,10 @@ def with_verdicts(job):
 def batch_evaluation(job):
     return evaluate(dict(name=item.get('filename'), saved=item.get('stored_reading'), extracted=item.get('reading'),
                          all_digits=item.get('all_digits'), score=item.get('score'), status=item.get('status'),
-                         no_meter=extract_no_meter(item.get('raw_text')), blank=extract_blank(item.get('raw_text')))
-                    for item in job['images'] if item.get('status') in ('done', 'no_digits', 'no_meter', 'blank', 'error'))
+                         no_meter=item.get('status') == 'no_meter' or extract_no_meter(item.get('raw_text')),
+                         blank=extract_blank(item.get('raw_text')))
+                    for item in job['images']
+                    if item.get('status') in ('done', 'no_digits', 'no_meter', 'blank', 'off', 'error'))
 
 
 def process_image(job, item):

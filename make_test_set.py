@@ -7,7 +7,9 @@
 
 Rows (one per photo and group; a photo can be in more than one group):
   mismatch     every coloured row of the Mospërputhje sheet: green (AI right, reader wrong),
-               red (AI wrong on a visible display), yellow (unclear photo)
+               red (AI wrong on a visible display), yellow (unclear photo). A green row's
+               truth is what the AI read in the details CSV (the saved reading is the wrong
+               one there), so a later run that reads it differently counts as broken
   low_quality  every coloured row of the low-quality review ("Foto me cilësi të dobët"): green
                (unreadable by a person too), red (readable, AI failed), yellow (undecided); with
                the true reading from photoreview_finetune.xlsx (sheet Etiketat) when typed
@@ -160,6 +162,9 @@ def main(argv=None):
     with open(args.details, encoding='utf-8-sig', newline='') as file:
         details = list(csv.DictReader(file))
     by_stem = {_stem(row['picture_name']): row['picture_name'] for row in details}
+    # what the AI read in this run: its whole part when written, else all its digits
+    ai_read = {_stem(row['picture_name']): re.sub(r'\D', '', row.get('extracted_whole') or '')
+               or re.sub(r'\D', '', row.get('extracted_reading') or '') for row in details}
     folder = Path(args.photo_dir)
     rows, missing, unresolved = [], [], []
     examples = set()
@@ -181,7 +186,8 @@ def main(argv=None):
 
     if args.mismatch_xlsx:
         for name, colour, number in coloured_rows(args.mismatch_xlsx, args.mismatch_sheet, ('mosp',), unresolved):
-            add(name, 'mismatch', colour, review_row=number)
+            add(name, 'mismatch', colour, ai_read.get(_stem(name), '') if colour == 'green' else '',
+                review_row=number)
     labels = truths(args.labels_xlsx, args.labels_sheet, args.truth_column) if args.labels_xlsx else {}
     review = (csv_rows(args.lowq_csv) if args.lowq_csv else
               coloured_rows(args.lowq_xlsx, args.lowq_sheet, ('cil', 'dob'), unresolved) if args.lowq_xlsx else [])
